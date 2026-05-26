@@ -31,7 +31,7 @@ FORMAT = {
     "line_width":     2500,         # internal set -w units (NOT points); 2500 ~ thick line
     "legend_border":  False,        # True = keep the box around the legend
     "frame":          "box",        # "box" = full frame, "L" = left + bottom only
-    "font_size":      36,           # pt, axis titles + tick labels
+    "font_size":      24,           # pt, axis titles + tick labels
     "x_range":        (300, 700),   # (from, to) in nm
     "x_major_ticks":  5,            # TOTAL number of major ticks on the X axis
     "x_minor_ticks":  1,            # number of small ticks between each pair of X major ticks
