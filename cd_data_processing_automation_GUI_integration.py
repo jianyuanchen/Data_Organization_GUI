@@ -90,9 +90,13 @@ def nice_ceil(x: float) -> float:
 
 
 def parse_speed(stem: str) -> str:
-    """'...50_50_0-005mms_160C...' -> '0.005mms'  (hyphen = decimal point)."""
-    m = re.search(r"(\d+(?:-\d+)?)mms", stem, re.IGNORECASE)
-    return m.group(1).replace("-", ".") + "mms" if m else ""
+    """'..._v0p005_AN_...' -> '0.005 mm/s'  ('p' = decimal point).
+
+    Matches a 'v<number>' token in the new filename convention (e.g. v0p005,
+    v0p01, v50). Returns '' if no speed token is found.
+    """
+    m = re.search(r"(?:^|_)v(\d+(?:p\d+)?)(?:_|$)", stem)
+    return m.group(1).replace("p", ".") + " mm/s" if m else ""
 
 
 def read_csv_columns(path):

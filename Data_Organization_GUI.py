@@ -6,15 +6,15 @@ Parses metadata from strictly-named CSV files, stores it in a SQLite database
 selected scans to OriginPro for batch plotting.
 
 Filename convention (underscore-separated):
-    Series _ Poly1 _ Poly2 _ Ratio _ ConcSolvent _ State _ Speed [_ Temp if AN] _ RotIn _ RotOut
+    Series _ Poly1 _ Poly2 _ Ratio _ ConcSolvent _ Speed _ State [_ Temp if AN] _ Gval _ Wavelength
 
-    R1_S-F8BT_C-PFBT100_50x50_20CB_AN_v0p005_T160_0_0
-    R3_F8BT_None_100_20Tol_AP_v0p005_0_0
+    R1_C-PFBT100_S-F8BT_50x50_20CB_v0p005_AN_T160_gval=0p047_500nm
+    R3_F8BT_None_100_20Tol_v0p005_AP_gval=0p042_493nm
 
-Stack: PyQt6, pandas, sqlite3 (stdlib), pywin32 (OriginPro COM, Windows only).
+Stack: PyQt6, sqlite3 (stdlib), pywin32 (OriginPro COM, Windows only).
 Run with uv:
-    uv run python cd_gui.py
-pyproject deps:  pyqt6  pandas  pywin32
+    uv run python Data_Organization_GUI.py
+pyproject deps:  pyqt6  pywin32
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
@@ -38,7 +37,6 @@ from PyQt6.QtWidgets import (
 
 DB_PATH = "cd_metadata.db"
 DEFAULT_ANNEAL_TIME = 10          # minutes; not stored in filename
-WAVELENGTH_FLOOR = 300            # drop rows where wavelength <= this (data ends ~row 801)
 SOLVENTS = ["CB", "DCB", "Tol"]   # controlled vocabulary
 
 
@@ -69,8 +67,8 @@ class Meta:
     speed_mm_s: float
     anneal_temp: Optional[int]
     anneal_time: Optional[int]   # default tag, not from filename
-    rot_in: int
-    rot_out: int
+    peak_g: float                # peak g-value, parsed from 'gval=' token
+    peak_wl: int                 # peak wavelength (nm)
 
 
 def classify_polymer(token: str):
@@ -99,17 +97,42 @@ def _derive_config(p1_chir, p2_chir, n_components):
 
 
 def parse_filename(path: str) -> Meta:
-    """Parse a CSV path into Meta. Raises ValueError on malformed names."""
+    """Parse a CSV path into Meta. Raises ValueError on malformed names.
+
+    Convention:
+        Series _ Poly1 _ Poly2 _ Ratio _ ConcSolvent _ Speed _ State
+            [_ Temp if AN] _ Gval _ Wavelength
+
+    The last two tokens are always Gval ('gval=0p047') then Wavelength ('500nm').
+    Temp ('T###') appears only when State == 'AN'.
+    """
     stem = Path(path).stem
     f = stem.split("_")
     if len(f) < 9:
         raise ValueError(f"Too few fields ({len(f)}) in '{stem}'")
 
-    # Rotation is always the last two tokens; parse remaining fields from front.
-    rot_out = int(f.pop())
-    rot_in = int(f.pop())
+    # Pull the last two tokens (Gval, Wavelength) off the end.
+    wl_tok = f.pop()           # e.g. "500nm"
+    g_tok  = f.pop()           # e.g. "gval=0p047"
+    if not wl_tok.endswith("nm"):
+        raise ValueError(f"Bad wavelength token '{wl_tok}'")
+    try:
+        peak_wl = int(wl_tok[:-2])
+    except ValueError:
+        raise ValueError(f"Bad wavelength token '{wl_tok}'")
+    if not g_tok.startswith("gval="):
+        raise ValueError(f"Bad g-value token '{g_tok}'")
+    try:
+        peak_g = float(g_tok[len("gval="):].replace("p", "."))
+    except ValueError:
+        raise ValueError(f"Bad g-value token '{g_tok}'")
 
-    series, p1, p2, ratio, conc_solv, state, speed = f[0:7]
+    # Remaining 7 tokens (AP) or 8 tokens (AN with T###).
+    if len(f) not in (7, 8):
+        raise ValueError(
+            f"Unexpected field count in '{stem}' (got {len(f) + 2} total)")
+
+    series, p1, p2, ratio, conc_solv, speed, state = f[0:7]
     temp_tok = f[7] if len(f) > 7 else None
 
     # conc + solvent, e.g. 20CB
@@ -118,21 +141,31 @@ def parse_filename(path: str) -> Meta:
         raise ValueError(f"Bad conc/solvent token '{conc_solv}'")
     conc, solvent = int(m.group(1)), m.group(2)
 
-    if state not in ("AP", "AN"):
-        raise ValueError(f"Bad film state '{state}' (expected AP/AN)")
-
     # speed: v0p005 -> 0.005
     if not speed.startswith("v"):
         raise ValueError(f"Bad speed token '{speed}'")
-    speed_val = float(speed[1:].replace("p", "."))
+    try:
+        speed_val = float(speed[1:].replace("p", "."))
+    except ValueError:
+        raise ValueError(f"Bad speed token '{speed}'")
 
-    anneal_temp = None
-    if temp_tok is not None:
+    if state not in ("AP", "AN"):
+        raise ValueError(f"Bad film state '{state}' (expected AP/AN)")
+
+    anneal_temp: Optional[int] = None
+    if state == "AN":
+        if temp_tok is None:
+            raise ValueError("Annealed film missing T### token")
         if not temp_tok.startswith("T"):
             raise ValueError(f"Bad temp token '{temp_tok}'")
-        anneal_temp = int(temp_tok[1:])
-    if state == "AN" and anneal_temp is None:
-        raise ValueError("Annealed film missing T### token")
+        try:
+            anneal_temp = int(temp_tok[1:])
+        except ValueError:
+            raise ValueError(f"Bad temp token '{temp_tok}'")
+    else:  # AP
+        if temp_tok is not None:
+            raise ValueError(
+                f"AP film should have no temp token, got '{temp_tok}'")
 
     p1b, p1c, p1h, p1p = classify_polymer(p1)
     p2b, p2c, p2h, p2p = classify_polymer(p2)
@@ -146,7 +179,7 @@ def parse_filename(path: str) -> Meta:
         ratio=ratio, conc=conc, solvent=solvent, film_state=state,
         speed_mm_s=speed_val, anneal_temp=anneal_temp,
         anneal_time=(DEFAULT_ANNEAL_TIME if state == "AN" else None),
-        rot_in=rot_in, rot_out=rot_out,
+        peak_g=peak_g, peak_wl=peak_wl,
     )
 
 
@@ -157,17 +190,30 @@ def parse_filename(path: str) -> Meta:
 COLUMNS = list(Meta.__annotations__.keys())
 
 
+_TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
+              "p1_hand", "p2_name", "p2_backbone", "p2_chirality", "p2_hand",
+              "config", "ratio", "solvent", "film_state"}
+_REAL_COLS = {"speed_mm_s", "peak_g"}
+
+
+def _sqltype(col: str) -> str:
+    if col in _TEXT_COLS:
+        return "TEXT"
+    if col in _REAL_COLS:
+        return "REAL"
+    return "INTEGER"
+
+
 class DB:
     def __init__(self, path=DB_PATH):
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        cols = ", ".join(f"{c} TEXT" if c in ("csv_path", "series", "p1_name",
-            "p1_backbone", "p1_chirality", "p1_hand", "p2_name", "p2_backbone",
-            "p2_chirality", "p2_hand", "config", "ratio", "solvent", "film_state")
-            else f"{c} REAL" if c == "speed_mm_s"
-            else f"{c} INTEGER" for c in COLUMNS)
-        self.conn.execute(f"CREATE TABLE IF NOT EXISTS scans ({cols}, "
-                          f"PRIMARY KEY(csv_path))")
+        # Schema can change between runs; drop and recreate so the table always
+        # matches the current Meta dataclass.
+        self.conn.execute("DROP TABLE IF EXISTS scans")
+        cols = ", ".join(f"{c} {_sqltype(c)}" for c in COLUMNS)
+        self.conn.execute(
+            f"CREATE TABLE scans ({cols}, PRIMARY KEY(csv_path))")
         self.conn.commit()
 
     def upsert(self, m: Meta):
@@ -198,111 +244,7 @@ class DB:
 
 
 # ----------------------------------------------------------------------------
-# 3. OriginPro plotting worker (runs in a QThread)
-# ----------------------------------------------------------------------------
-
-# Map logical signals to likely CSV column names (case-insensitive, first match).
-COLUMN_ALIASES = {
-    "wavelength": ["wavelength", "wl", "nm"],
-    "cd": ["cd", "ellipticity", "mdeg"],
-    "gvalue": ["gvalue", "g-value", "g_value", "gabs", "g"],
-    "uvvis": ["uvvis", "uv-vis", "absorbance", "abs", "uv"],
-}
-PLOT_SIGNALS = {"CD": "cd", "G-value": "gvalue", "UV-Vis": "uvvis"}
-
-
-def _find_col(df: pd.DataFrame, key: str):
-    lower = {c.lower().strip(): c for c in df.columns}
-    for alias in COLUMN_ALIASES[key]:
-        if alias in lower:
-            return lower[alias]
-    return None
-
-
-class OriginWorker(QThread):
-    progress = pyqtSignal(int)
-    log = pyqtSignal(str)
-    finished_ok = pyqtSignal()
-
-    def __init__(self, rows: list[dict], signals: list[str]):
-        super().__init__()
-        self.rows = rows
-        self.signals = signals  # e.g. ["CD", "G-value"]
-
-    def run(self):
-        try:
-            import win32com.client
-            self.log.emit("Connecting to OriginPro (Origin.ApplicationSI)...")
-            origin = win32com.client.Dispatch("Origin.ApplicationSI")
-            origin.Execute("doc -mc 1;")  # show Origin
-        except Exception as e:
-            self.log.emit(f"ERROR: could not connect to Origin: {e}")
-            return
-
-        # One master worksheet + graph per requested signal.
-        books = {}
-        for sig in self.signals:
-            book = origin.CreatePage(2, f"{sig.replace('-', '')}_data", "Origin")
-            books[sig] = {"book": book, "next_col": 0, "series": []}
-            self.log.emit(f"Created workbook for {sig}: {book}")
-
-        total = len(self.rows)
-        for i, row in enumerate(self.rows):
-            path = row["csv_path"]
-            label = Path(path).stem
-            try:
-                df = pd.read_csv(path)
-            except Exception as e:
-                self.log.emit(f"  skip {label}: read error {e}")
-                self.progress.emit(int((i + 1) / total * 100))
-                continue
-
-            wl_col = _find_col(df, "wavelength")
-            if wl_col is None:
-                self.log.emit(f"  skip {label}: no wavelength column")
-                self.progress.emit(int((i + 1) / total * 100))
-                continue
-
-            # CRITICAL data cleaning: keep wavelength > 300 nm only.
-            df = df[df[wl_col] > WAVELENGTH_FLOOR].reset_index(drop=True)
-
-            for sig in self.signals:
-                ycol = _find_col(df, PLOT_SIGNALS[sig])
-                if ycol is None:
-                    continue
-                b = books[sig]
-                ws = origin.FindWorksheet(b["book"])
-                c0 = b["next_col"]
-                # push X (wavelength) and Y (signal) as two new columns
-                data = df[[wl_col, ycol]].to_numpy().tolist()
-                origin.PutWorksheet(b["book"], data, 0, c0)
-                # name the Y column so the legend is readable
-                origin.Execute(
-                    f'win -a {b["book"]}; wks.col{c0 + 2}.comment$ = "{label}";')
-                b["series"].append((c0, c0 + 1))
-                b["next_col"] += 2
-
-            self.log.emit(f"  loaded {label}")
-            self.progress.emit(int((i + 1) / total * 100))
-
-        # Build one line graph per signal containing every series.
-        for sig, b in books.items():
-            if not b["series"]:
-                continue
-            gname = origin.CreatePage(3, f"{sig.replace('-', '')}_plot", "LINE")
-            for (xc, yc) in b["series"]:
-                origin.Execute(
-                    f'win -a {gname}; plotxy iy:={b["book"]}!({xc + 1},{yc + 1}) '
-                    f'plot:=200 ogl:=<active>;')
-            self.log.emit(f"Built graph {gname} for {sig} "
-                          f"({len(b['series'])} series)")
-
-        self.log.emit("Done.")
-        self.finished_ok.emit()
-
-
-# ----------------------------------------------------------------------------
-# 4. GUI
+# 3. GUI
 # ----------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
@@ -311,7 +253,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CD Data Automation")
         self.resize(1100, 760)
         self.db = DB()
-        self.worker = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -566,13 +507,10 @@ class MainWindow(QMainWindow):
         if not getattr(self, "current_rows", None):
             self.log("No scans match the current filters.")
             return
-        self.run_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.worker = OriginWorker(self.current_rows, signals)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.log.connect(self.log)
-        self.worker.finished_ok.connect(lambda: self.run_btn.setEnabled(True))
-        self.worker.start()
+        files = [Path(r["csv_path"]).name for r in self.current_rows]
+        self.log(f"Would process {len(files)} file(s): {', '.join(files)}")
+        self.log(f"Signals: {', '.join(signals)}")
+        # TODO: call cd_data_processing graphing here
 
 
 def main():
