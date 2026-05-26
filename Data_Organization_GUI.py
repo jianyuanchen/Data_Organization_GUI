@@ -253,6 +253,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CD Data Automation")
         self.resize(1100, 760)
         self.db = DB()
+        # Staging table edits are gated by this flag. Default off so a stray
+        # double-click can't overwrite a parsed value silently.
+        self.edit_mode = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -291,10 +294,27 @@ class MainWindow(QMainWindow):
         return box
 
     # --- staging table -----------------------------------------------------
+    _STAGING_TITLE_READONLY = ("Staging Area  "
+                               "(read-only - click Edit to change values)")
+    _STAGING_TITLE_EDITING  = ("Staging Area  "
+                               "(EDITING - changes save to database)")
+
     def _build_staging_table(self):
-        box = QGroupBox("Staging Area  (double-click any cell to correct a "
-                        "parsed value; edits are saved to the database)")
-        v = QVBoxLayout(box)
+        self.staging_box = QGroupBox(self._STAGING_TITLE_READONLY)
+        v = QVBoxLayout(self.staging_box)
+
+        # Header row: Edit toggle right-aligned above the table.
+        header = QHBoxLayout()
+        header.addStretch(1)
+        self.edit_btn = QPushButton("Edit")
+        self.edit_btn.setCheckable(True)
+        self.edit_btn.setToolTip(
+            "Toggle staging-table editing. While off, cells cannot be changed "
+            "and nothing writes to the database.")
+        self.edit_btn.toggled.connect(self.on_toggle_edit)
+        header.addWidget(self.edit_btn)
+        v.addLayout(header)
+
         self.table = QTableWidget()
         self.table.setColumnCount(len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
@@ -302,7 +322,7 @@ class MainWindow(QMainWindow):
             QHeaderView.ResizeMode.Interactive)
         self.table.itemChanged.connect(self.on_cell_edited)
         v.addWidget(self.table)
-        return box
+        return self.staging_box
 
     # --- cascading filter panel -------------------------------------------
     def _build_filter_panel(self):
@@ -620,7 +640,10 @@ class MainWindow(QMainWindow):
             for c, col in enumerate(COLUMNS):
                 val = "" if row[col] is None else str(row[col])
                 item = QTableWidgetItem(val)
-                if col == "csv_path":
+                # csv_path is ALWAYS locked. Everything else is locked unless
+                # edit mode is on -- writes to the DB go through on_cell_edited
+                # which only fires when a cell is actually editable.
+                if (col == "csv_path") or (not self.edit_mode):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
@@ -633,6 +656,44 @@ class MainWindow(QMainWindow):
         self.db.update_cell(csv_path, col, item.text())
         self.current_rows[row][col] = item.text()
         self.log(f"Updated {col} for {Path(csv_path).name}")
+
+    def on_toggle_edit(self, checked: bool):
+        """Flip edit mode and apply the new editable state to existing items
+        in place -- no DB reload. csv_path stays locked in either mode.
+        """
+        self.edit_mode = checked
+
+        # Block itemChanged so flag flips can't be mistaken for a data edit
+        # and trigger an accidental DB write.
+        self.table.blockSignals(True)
+        try:
+            for r in range(self.table.rowCount()):
+                for c, col in enumerate(COLUMNS):
+                    item = self.table.item(r, c)
+                    if item is None:
+                        continue
+                    locked = (not self.edit_mode) or (col == "csv_path")
+                    flags = item.flags()
+                    if locked:
+                        flags &= ~Qt.ItemFlag.ItemIsEditable
+                    else:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                    item.setFlags(flags)
+        finally:
+            self.table.blockSignals(False)
+
+        # Visual cue so the user always knows which mode they're in.
+        if self.edit_mode:
+            self.edit_btn.setText("Editing - click to lock")
+            self.edit_btn.setStyleSheet(
+                "background:#f1c40f;color:black;font-weight:bold;")
+            self.staging_box.setTitle(self._STAGING_TITLE_EDITING)
+            self.log("Edit mode ON - cell changes will save to the database.")
+        else:
+            self.edit_btn.setText("Edit")
+            self.edit_btn.setStyleSheet("")
+            self.staging_box.setTitle(self._STAGING_TITLE_READONLY)
+            self.log("Edit mode OFF - staging table is read-only.")
 
     def on_run(self):
         signals = [name for chk, name in
