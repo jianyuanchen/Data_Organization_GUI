@@ -242,8 +242,8 @@ def quantities_for(labels):
     return out
 
 
-def _clear_existing(quantities, log):
-    """Destroy workbooks/graphs left over from previous runs of build_plots.
+def clear_quantities(quantities, log=print):
+    """Destroy the workbook + overlay graph for each Quantity in `quantities`.
 
     A workbook's SHORT name (e.g. 'CD', or Origin's auto-generated 'Book1') and
     its LONG name (e.g. 'g-value') are independent, so we match on BOTH per page
@@ -302,7 +302,7 @@ def build_plots(files, quantities, log=print):
         op.set_show(True)
 
     # Repeat runs would otherwise accumulate 'Master CD1' / 'g-value2' duplicates.
-    _clear_existing(quantities, log)
+    clear_quantities(quantities, log)
 
     log(f"Found {len(files)} CSV file(s).")
 

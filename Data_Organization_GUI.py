@@ -379,8 +379,29 @@ class MainWindow(QMainWindow):
         self.chk_uv = QCheckBox("Wavelength vs. UV-Vis")
         self.chk_mm = QCheckBox("Mueller Matrix  (coming soon)")
         self.chk_mm.setEnabled(False)
-        for w in (self.chk_cd, self.chk_g, self.chk_uv, self.chk_mm):
-            v.addWidget(w)
+
+        # One row per real signal: [ checkbox ][ x button ]. The "x" clears that
+        # one plot from Origin and unchecks its box. Store buttons on self so
+        # tests / future code can poke at them by label.
+        self.clear_btns = {}
+        for chk, label in [(self.chk_cd, "CD"),
+                           (self.chk_g,  "G-value"),
+                           (self.chk_uv, "UV-Vis")]:
+            row = QHBoxLayout()
+            row.addWidget(chk, stretch=1)
+            x_btn = QPushButton("x")
+            x_btn.setFixedWidth(24)
+            x_btn.setToolTip(f"Clear {label} from Origin and uncheck this box")
+            # `sig=label` captures the value at lambda-definition time, otherwise
+            # all three buttons would close over the loop variable's final value.
+            x_btn.clicked.connect(lambda _checked, sig=label: self.on_clear_signal(sig))
+            row.addWidget(x_btn)
+            v.addLayout(row)
+            self.clear_btns[label] = x_btn
+
+        # Mueller Matrix is disabled and has no x button.
+        v.addWidget(self.chk_mm)
+
         self.generate_btn = QPushButton("Generate Plots")
         self.generate_btn.clicked.connect(self.on_generate_plots)
         v.addWidget(self.generate_btn)
@@ -533,7 +554,7 @@ class MainWindow(QMainWindow):
         # Lazy import so the GUI still launches when originpro isn't installed.
         try:
             from cd_data_processing_automation_GUI_integration import (
-                build_plots, quantities_for)
+                build_plots, clear_quantities, quantities_for)
         except ImportError as e:
             self.log(f"Cannot import graphing module (is originpro installed?): {e}")
             return
@@ -544,6 +565,15 @@ class MainWindow(QMainWindow):
         self.log(f"Generating {len(signals)} plot(s) for {len(files)} file(s)...")
         QApplication.processEvents()
         try:
+            # Sync Origin to the checkboxes: nuke ALL THREE signal windows up
+            # front, then rebuild only the checked ones. build_plots will
+            # re-clear the ones it's about to draw, which is a harmless no-op.
+            try:
+                clear_quantities(
+                    quantities_for(["CD", "G-value", "UV-Vis"]),
+                    log=self.log)
+            except Exception as e:
+                self.log(f"Pre-clear failed: {e}")
             build_plots(files, quantities_for(signals), log=self.log)
             self.log("Done.")
         except Exception as e:
@@ -552,6 +582,35 @@ class MainWindow(QMainWindow):
             self.generate_btn.setText("Generate Plots")
             self.generate_btn.setEnabled(True)
             self.run_btn.setEnabled(True)
+
+    def on_clear_signal(self, signal_label):
+        """Clear one signal's Origin windows AND uncheck its checkbox.
+
+        Intent: 'I don't want this plot.' The box unchecks even if Origin is
+        unreachable, so the next Generate won't rebuild it.
+        """
+        chk_map = {"CD": self.chk_cd, "G-value": self.chk_g,
+                   "UV-Vis": self.chk_uv}
+        chk = chk_map.get(signal_label)
+        if chk is not None:
+            # Block signals so any future stateChanged handler doesn't fire as a
+            # side effect of programmatic unchecking.
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+
+        try:
+            from cd_data_processing_automation_GUI_integration import (
+                clear_quantities, quantities_for)
+        except ImportError as e:
+            self.log(f"Cannot import graphing module (is originpro installed?): {e}")
+            return
+
+        try:
+            clear_quantities(quantities_for([signal_label]), log=self.log)
+            self.log(f"Cleared {signal_label} from Origin.")
+        except Exception as e:
+            self.log(f"Could not clear {signal_label} from Origin: {e}")
 
 
 def main():
