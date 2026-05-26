@@ -27,7 +27,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
@@ -278,9 +278,8 @@ class MainWindow(QMainWindow):
         self.path_field.setPlaceholderText("No folder selected")
         browse = QPushButton("Browse...")
         browse.clicked.connect(self.on_browse)
-        self.origin_status = QLabel("  Origin: not connected  ")
-        self.origin_status.setStyleSheet(
-            "background:#c0392b;color:white;border-radius:4px;")
+        self.origin_status = QLabel()
+        self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
         connect.clicked.connect(self.on_connect_origin)
         h.addWidget(QLabel("Folder:"))
@@ -445,19 +444,133 @@ class MainWindow(QMainWindow):
         self.refresh_filter_options()
         self.refresh_table()
 
-    def on_connect_origin(self):
+    # Three distinct indicator states:
+    #   connected -> green   (attached + verified)
+    #   neutral   -> gray    (no Origin running, but nothing is wrong)
+    #   failed    -> red     (originpro missing, or attach/verify exception)
+    _STATUS_COLORS = {"connected": "#27ae60",
+                      "neutral":   "#7f8c8d",
+                      "failed":    "#c0392b"}
+
+    def _set_origin_status(self, state: str, text: str):
+        color = self._STATUS_COLORS.get(state, "#c0392b")
+        self.origin_status.setText(f"  {text}  ")
+        self.origin_status.setStyleSheet(
+            f"background:{color};color:white;border-radius:4px;")
+
+    def _connect_origin(self, launch: bool, verbose: bool = True):
+        """Attach to Origin and verify. Two modes:
+
+            launch=False  -> detect-only. Attaches if an Origin instance is
+                             already running; never spawns one. Used at startup
+                             so opening the GUI doesn't boot Origin.
+            launch=True   -> attach to a running instance if present, otherwise
+                             launch Origin with a blank session.
+
+        Verifies the connection by reading version + EXE path back. On any
+        failure: red indicator, log the exception, no crash. Plotting does not
+        depend on this -- originpro auto-attaches on first plot regardless.
+        """
+        # 1. Lazy import: GUI still launches when originpro isn't installed.
+        try:
+            import originpro as op
+        except ImportError as e:
+            self._set_origin_status("failed", "Origin: not available")
+            if verbose:
+                self.log(f"originpro is not installed: {e}")
+            return
+
+        # 2. Detect a RUNNING Origin without triggering a launch. Origin
+        #    registers in the ROT under one of two ProgIDs depending on how it
+        #    was started; the single-instance automation server name
+        #    ('Origin.ApplicationSI') is what a normally-opened Origin uses, so
+        #    try it FIRST. GetActiveObject raises if the ProgID isn't in the
+        #    ROT, so each probe is harmless and cannot spawn Origin.
+        running_progid = None
         try:
             import win32com.client
-            win32com.client.Dispatch("Origin.ApplicationSI")
-            self.origin_status.setText("  Origin: connected  ")
-            self.origin_status.setStyleSheet(
-                "background:#27ae60;color:white;border-radius:4px;")
-            self.log("OriginPro connection OK.")
+            for progid in ("Origin.ApplicationSI", "Origin.Application"):
+                try:
+                    win32com.client.GetActiveObject(progid)
+                    running_progid = progid
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            running_progid = None
+        running = running_progid is not None
+
+        # 3. Detect-only mode: if nothing's running, stay neutral and hint.
+        if not running and not launch:
+            self._set_origin_status("neutral", "Origin: not connected")
+            if verbose:
+                self.log("Origin not running - click Connect to start it.")
+            return
+
+        # 4. Attach (and launch if needed). When an existing instance was
+        #    detected, explicitly call op.attach() so originpro binds to THAT
+        #    instance rather than spawning a fresh one. op.set_show(True) then
+        #    just ensures the window is visible. Same call the graphing module
+        #    uses on entry, so behavior is consistent.
+        try:
+            if running:
+                if verbose:
+                    self.log(f"Found running Origin via {running_progid}.")
+                try:
+                    op.attach()
+                except Exception:
+                    # Attach failure is non-fatal -- set_show below still tries
+                    # to bind, and if that also fails we land in the outer
+                    # except and report connection failed.
+                    pass
+            op.set_show(True)
+
+            # 5. Verify with cheap read-backs. Both are wrapped so a missing
+            #    API on one doesn't blow up the other.
+            version = None
+            try:
+                version = op.lt_float("@V")        # numeric build version
+            except Exception:
+                version = None
+            exe_path = ""
+            try:
+                exe_path = op.path("e") or ""      # Origin EXE folder
+            except Exception:
+                exe_path = ""
+
+            # Fallback proof-of-life: create a hidden workbook and immediately
+            # destroy it. Nothing left behind in Origin.
+            if version is None and not exe_path:
+                test = op.new_book("w", lname="_diao_connect_test_", hidden=True)
+                if test is None:
+                    raise RuntimeError("could not create test workbook")
+                test.destroy()
+
+            # 6. Single useful log line + green indicator. "Found running" vs
+            #    "Launched" so the user knows whether *we* spawned Origin.
+            action = "Found running" if running else "Launched"
+            bits = [f"{action} OriginPro"]
+            if version is not None:
+                bits.append(str(version))
+            if exe_path:
+                bits.append(f"at {exe_path}")
+            if verbose:
+                self.log(" ".join(bits) + ".")
+            self._set_origin_status("connected", "Origin: connected")
         except Exception as e:
-            self.origin_status.setText("  Origin: failed  ")
-            self.origin_status.setStyleSheet(
-                "background:#c0392b;color:white;border-radius:4px;")
-            self.log(f"Origin connect failed: {e}")
+            self._set_origin_status("failed", "Origin: connection failed")
+            if verbose:
+                self.log(f"Origin connect failed: {e}")
+
+    def on_connect_origin(self):
+        """User clicked Connect: attach if running, otherwise launch Origin."""
+        self._connect_origin(launch=True)
+
+    def startup_origin_check(self):
+        """Startup probe: attach if Origin is already open, otherwise stay
+        neutral. Never spawns Origin -- the user must click Connect for that.
+        """
+        self._connect_origin(launch=False)
 
     def refresh_filter_options(self):
         self.f_solvent.blockSignals(True)
@@ -617,6 +730,10 @@ def main():
     app = QApplication([])
     win = MainWindow()
     win.show()
+    # Defer until after the first paint so the window appears instantly even if
+    # the COM probe takes a moment. Origin is heavy; we must never boot it just
+    # to open the GUI -- startup_origin_check uses launch=False.
+    QTimer.singleShot(0, win.startup_origin_check)
     app.exec()
 
 
