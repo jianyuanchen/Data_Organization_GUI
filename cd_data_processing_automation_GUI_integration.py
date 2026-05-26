@@ -42,16 +42,38 @@ FORMAT = {
 }
 
 
+def _sanitize_short_name(s: str) -> str:
+    """Origin short-name rules: letters/digits/underscore only, starts with a letter.
+
+    'CD' -> 'CD' ; 'g-value' -> 'gvalue' ; 'UV-Vis' -> 'UVVis' ; 'Master CD' -> 'MasterCD'.
+    Falls back to 'X' + sanitized if the result would otherwise be empty / digit-led.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "", s)
+    if not cleaned or not cleaned[0].isalpha():
+        cleaned = "X" + cleaned
+    return cleaned
+
+
 @dataclass
 class Quantity:
     src_col: int                    # 0-based column index in each CSV (A=0, B=1, C=2, D=3)
     col_lname: str                  # Long Name for the consolidated columns
-    book_lname: str                 # workbook name
-    graph_lname: str                # graph name
+    book_lname: str                 # workbook LONG name (e.g. 'g-value')
+    graph_lname: str                # graph    LONG name (e.g. 'Master g-value')
     overrides: dict = field(default_factory=dict)   # FORMAT keys to override for this graph
     wks: object = None              # consolidation worksheet (set at runtime)
     gp:  object = None              # overlay graph page    (set at runtime)
     data_absmax: float = 0.0        # largest |y| seen, for the symmetric Y range (runtime)
+    # Deterministic SHORT names so we can both create AND delete by the same string.
+    # Origin's auto-suffix (CD->CD1, Book1/Book2) is what we're avoiding here.
+    book_sname:  str = ""           # derived in __post_init__ from book_lname
+    graph_sname: str = ""           # derived in __post_init__ from graph_lname
+
+    def __post_init__(self):
+        if not self.book_sname:
+            self.book_sname = _sanitize_short_name(self.book_lname)
+        if not self.graph_sname:
+            self.graph_sname = _sanitize_short_name(self.graph_lname)
 
 
 # Trim this list to just the g-value entry if that's all you need.
@@ -223,28 +245,45 @@ def quantities_for(labels):
 def _clear_existing(quantities, log):
     """Destroy workbooks/graphs left over from previous runs of build_plots.
 
-    Matches each quantity's `book_lname` / `graph_lname` exactly AND Origin's
-    auto-suffixed variants (e.g. 'CD' / 'CD1' / 'CD2'), so accumulated duplicates
-    from prior runs get cleaned up too. Iterates with `op.pages(type_)`, matches
-    pages by long-name (since the short-name is auto-generated and not what we
-    set), and calls `.destroy()` on each hit. Unrelated windows the user has
-    open are NOT touched.
+    A workbook's SHORT name (e.g. 'CD', or Origin's auto-generated 'Book1') and
+    its LONG name (e.g. 'g-value') are independent, so we match on BOTH per page
+    type. Each target also allows a trailing digit run -- Origin appends a
+    numeric suffix on name collisions, so a leftover from a prior run can show
+    up as 'CD', 'CD1', 'CD12', 'gvalue1', 'MasterCD2', etc. Unrelated windows
+    are NOT touched (we only match the quantities being rebuilt).
     """
-    bases = [b for q in quantities for b in (q.book_lname, q.graph_lname)]
-    # base, base+digits  (Origin appends a numeric suffix on name collisions)
-    patterns = [re.compile(rf"^{re.escape(b)}\d*$") for b in bases]
+    # Two pattern sets per page type: one for short names, one for long names.
+    def _pats(items):
+        return [re.compile(rf"^{re.escape(s)}\d*$") for s in items if s]
 
-    for page_type in ("w", "g"):
+    targets = {
+        "w": {
+            "sname": _pats(q.book_sname for q in quantities),
+            "lname": _pats(q.book_lname for q in quantities),
+        },
+        "g": {
+            "sname": _pats(q.graph_sname for q in quantities),
+            "lname": _pats(q.graph_lname for q in quantities),
+        },
+    }
+
+    for page_type, pats in targets.items():
         try:
             pages = list(op.pages(page_type))
         except Exception:
             pages = []
         for p in pages:
             try:
+                sname = getattr(p, "name", None) or ""
                 lname = getattr(p, "lname", None) or ""
-                if any(pat.match(lname) for pat in patterns):
+                hit = None
+                if any(pat.match(sname) for pat in pats["sname"]):
+                    hit = sname
+                elif any(pat.match(lname) for pat in pats["lname"]):
+                    hit = lname
+                if hit is not None:
                     p.destroy()
-                    log(f"Cleared previous: {lname}")
+                    log(f"Cleared previous: {hit}")
             except Exception:
                 # A missing/already-destroyed page is a no-op, not an error.
                 pass
@@ -268,8 +307,17 @@ def build_plots(files, quantities, log=print):
     log(f"Found {len(files)} CSV file(s).")
 
     for q in quantities:                          # create the books + empty graphs
-        q.wks = op.new_book("w", lname=q.book_lname)[0]
-        q.gp  = op.new_graph(lname=q.graph_lname, template="line")
+        # Capture the WBook so we can pin its SHORT name. Without this, Origin
+        # leaves the short name as the auto-generated Book1/Book2/..., and any
+        # collision on the long name gets auto-suffixed too (CD -> CD1 -> CD2).
+        # Pinning both names makes the next run's cleanup deterministic.
+        book = op.new_book("w", lname=q.book_lname)
+        book.name  = q.book_sname
+        book.lname = q.book_lname
+        q.wks = book[0]
+        q.gp = op.new_graph(lname=q.graph_lname, template="line")
+        q.gp.name  = q.graph_sname
+        q.gp.lname = q.graph_lname
 
     col, wrote_x = 1, False                        # col = next free column; X written once
     for path in files:
