@@ -67,9 +67,11 @@ QUANTITIES = [
 ]
 
 
-# Cleanly release Origin if the script crashes.
-if op and op.oext:
-    sys.excepthook = lambda *a: (op.exit(), sys.__excepthook__(*a))
+# NOTE: the sys.excepthook hook that closes Origin on crash is installed only
+# when this file is run as a script (see the `if __name__ == "__main__":`
+# block at the bottom). Installing it at import time would hijack the GUI's
+# excepthook and could close Origin out from under the GUI on an unrelated
+# error.
 
 
 # ===========================================================================
@@ -191,19 +193,81 @@ def style_graph(q: Quantity):
 
 
 # ===========================================================================
-# MAIN
+# GUI ENTRY POINT  (build_plots / quantities_for)
 # ===========================================================================
-def main():
+
+# GUI signal label -> CSV source-column index (matches the QUANTITIES list).
+_LABEL_TO_SRCCOL = {"G-value": 1, "CD": 2, "UV-Vis": 3}
+
+
+def quantities_for(labels):
+    """Return module-level Quantity objects matching the GUI signal labels.
+
+    Resets each returned Quantity's runtime fields (wks, gp, data_absmax) so
+    repeat runs start clean.
+    """
+    by_src = {q.src_col: q for q in QUANTITIES}
+    out = []
+    for label in labels:
+        sc = _LABEL_TO_SRCCOL.get(label)
+        if sc is None or sc not in by_src:
+            continue
+        q = by_src[sc]
+        q.wks = None
+        q.gp = None
+        q.data_absmax = 0.0
+        out.append(q)
+    return out
+
+
+def _clear_existing(quantities, log):
+    """Destroy workbooks/graphs left over from previous runs of build_plots.
+
+    Matches each quantity's `book_lname` / `graph_lname` exactly AND Origin's
+    auto-suffixed variants (e.g. 'CD' / 'CD1' / 'CD2'), so accumulated duplicates
+    from prior runs get cleaned up too. Iterates with `op.pages(type_)`, matches
+    pages by long-name (since the short-name is auto-generated and not what we
+    set), and calls `.destroy()` on each hit. Unrelated windows the user has
+    open are NOT touched.
+    """
+    bases = [b for q in quantities for b in (q.book_lname, q.graph_lname)]
+    # base, base+digits  (Origin appends a numeric suffix on name collisions)
+    patterns = [re.compile(rf"^{re.escape(b)}\d*$") for b in bases]
+
+    for page_type in ("w", "g"):
+        try:
+            pages = list(op.pages(page_type))
+        except Exception:
+            pages = []
+        for p in pages:
+            try:
+                lname = getattr(p, "lname", None) or ""
+                if any(pat.match(lname) for pat in patterns):
+                    p.destroy()
+                    log(f"Cleared previous: {lname}")
+            except Exception:
+                # A missing/already-destroyed page is a no-op, not an error.
+                pass
+
+
+def build_plots(files, quantities, log=print):
+    """Build one workbook + overlay graph per quantity for the given file list.
+
+    `files` is an explicit list of CSV paths. `quantities` is any subset of
+    QUANTITIES (e.g. produced by quantities_for(...)). Output is piped through
+    `log` so the GUI can redirect it into its log box.
+
+    Must run on the main thread: originpro / COM is not reliably thread-safe.
+    """
     if op.oext:
         op.set_show(True)
 
-    files = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
-    if not files:
-        print(f"No .csv files found in: {os.path.abspath(DATA_DIR)}")
-        return
-    print(f"Found {len(files)} CSV file(s).")
+    # Repeat runs would otherwise accumulate 'Master CD1' / 'g-value2' duplicates.
+    _clear_existing(quantities, log)
 
-    for q in QUANTITIES:                          # create the books + empty graphs
+    log(f"Found {len(files)} CSV file(s).")
+
+    for q in quantities:                          # create the books + empty graphs
         q.wks = op.new_book("w", lname=q.book_lname)[0]
         q.gp  = op.new_graph(lname=q.graph_lname, template="line")
 
@@ -212,11 +276,11 @@ def main():
         cols = read_csv_columns(path)
         stem = os.path.splitext(os.path.basename(path))[0]
         if not cols:
-            print(f"  SKIPPED (no numeric data): {stem}")
+            log(f"  SKIPPED (no numeric data): {stem}")
             continue
 
         speed = parse_speed(stem)
-        for q in QUANTITIES:
+        for q in quantities:
             if not wrote_x:
                 q.wks.from_list(0, cols[0], WAVELENGTH_LNAME, axis="X")
             ydata = cols[q.src_col]
@@ -224,15 +288,31 @@ def main():
             q.data_absmax = max(q.data_absmax, max(abs(v) for v in ydata))  # for symmetric Y
 
         wrote_x = True
-        print(f"  added: {stem}  ({len(cols[0])} rows, {speed or 'n/a'})")
+        log(f"  added: {stem}  ({len(cols[0])} rows, {speed or 'n/a'})")
         col += 1
 
-    for q in QUANTITIES:
+    for q in quantities:
         overlay(q)
         style_graph(q)
 
-    print(f"\nDone. {col - 1} scan(s) consolidated. Origin left open for review.")
+    log(f"\nDone. {col - 1} scan(s) consolidated. Origin left open for review.")
+
+
+# ===========================================================================
+# MAIN  (standalone entry point)
+# ===========================================================================
+def main():
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
+    if not files:
+        print(f"No .csv files found in: {os.path.abspath(DATA_DIR)}")
+        return
+    build_plots(files, QUANTITIES)
 
 
 if __name__ == "__main__":
+    # Cleanly release Origin if the script crashes during a direct run. Kept
+    # behind __main__ so importing this module into the GUI doesn't replace
+    # the GUI's excepthook.
+    if op and op.oext:
+        sys.excepthook = lambda *a: (op.exit(), sys.__excepthook__(*a))
     main()

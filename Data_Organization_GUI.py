@@ -381,6 +381,9 @@ class MainWindow(QMainWindow):
         self.chk_mm.setEnabled(False)
         for w in (self.chk_cd, self.chk_g, self.chk_uv, self.chk_mm):
             v.addWidget(w)
+        self.generate_btn = QPushButton("Generate Plots")
+        self.generate_btn.clicked.connect(self.on_generate_plots)
+        v.addWidget(self.generate_btn)
         v.addStretch(1)
         return box
 
@@ -511,6 +514,44 @@ class MainWindow(QMainWindow):
         self.log(f"Would process {len(files)} file(s): {', '.join(files)}")
         self.log(f"Signals: {', '.join(signals)}")
         # TODO: call cd_data_processing graphing here
+
+    def on_generate_plots(self):
+        # Same checkbox/row checks as on_run, but here we actually drive the
+        # graphing module. Must stay on the main thread -- originpro + COM
+        # is not reliably thread-safe.
+        signals = [name for chk, name in
+                   [(self.chk_cd, "CD"), (self.chk_g, "G-value"),
+                    (self.chk_uv, "UV-Vis")] if chk.isChecked()]
+        if not signals:
+            self.log("Select at least one plot type.")
+            return
+        if not getattr(self, "current_rows", None):
+            self.log("No scans match the current filters.")
+            return
+        files = [r["csv_path"] for r in self.current_rows]
+
+        # Lazy import so the GUI still launches when originpro isn't installed.
+        try:
+            from cd_data_processing_automation_GUI_integration import (
+                build_plots, quantities_for)
+        except ImportError as e:
+            self.log(f"Cannot import graphing module (is originpro installed?): {e}")
+            return
+
+        self.generate_btn.setEnabled(False)
+        self.run_btn.setEnabled(False)
+        self.generate_btn.setText("Generating...")
+        self.log(f"Generating {len(signals)} plot(s) for {len(files)} file(s)...")
+        QApplication.processEvents()
+        try:
+            build_plots(files, quantities_for(signals), log=self.log)
+            self.log("Done.")
+        except Exception as e:
+            self.log(f"Plot generation failed: {e}")
+        finally:
+            self.generate_btn.setText("Generate Plots")
+            self.generate_btn.setEnabled(True)
+            self.run_btn.setEnabled(True)
 
 
 def main():
