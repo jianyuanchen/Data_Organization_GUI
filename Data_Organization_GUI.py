@@ -28,11 +28,12 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
-    QFileDialog, QGroupBox, QFrame, QHeaderView,
+    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
 )
 
 DB_PATH = "cd_metadata.db"
@@ -208,15 +209,34 @@ class DB:
     def __init__(self, path=DB_PATH):
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        # Schema can change between runs; drop and recreate so the table always
-        # matches the current Meta dataclass.
-        self.conn.execute("DROP TABLE IF EXISTS scans")
+        # Persist across runs. Fresh DB: CREATE TABLE builds the full schema.
+        # Existing DB: CREATE IF NOT EXISTS is a no-op, then ALTER TABLE ADD
+        # COLUMN migrates forward -- each call is wrapped because SQLite raises
+        # OperationalError when the column already exists, which is the normal
+        # case on every subsequent startup.
         cols = ", ".join(f"{c} {_sqltype(c)}" for c in COLUMNS)
         self.conn.execute(
-            f"CREATE TABLE scans ({cols}, PRIMARY KEY(csv_path))")
+            f"CREATE TABLE IF NOT EXISTS scans ({cols}, "
+            f"edited INTEGER NOT NULL DEFAULT 0, "
+            f"PRIMARY KEY(csv_path))")
+        for c in COLUMNS:
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE scans ADD COLUMN {c} {_sqltype(c)}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self.conn.execute(
+                "ALTER TABLE scans ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def upsert(self, m: Meta):
+        """Plain INSERT OR REPLACE. Clobbers the row (and resets the edited
+        flag to 0). Kept for callers that explicitly want filename truth;
+        on_browse uses upsert_preserving_edits instead.
+        """
         d = asdict(m)
         placeholders = ", ".join("?" for _ in COLUMNS)
         self.conn.execute(
@@ -224,11 +244,43 @@ class DB:
             f"VALUES ({placeholders})", [d[c] for c in COLUMNS])
         self.conn.commit()
 
+    def upsert_preserving_edits(self, m: Meta) -> str:
+        """Three-way upsert that protects manual corrections:
+
+            row missing               -> INSERT, edited=0    -> 'new'
+            row exists, edited == 0   -> UPDATE from Meta    -> 'updated'
+            row exists, edited == 1   -> leave untouched     -> 'preserved'
+        """
+        cur = self.conn.execute(
+            "SELECT edited FROM scans WHERE csv_path=?", (m.csv_path,))
+        row = cur.fetchone()
+        d = asdict(m)
+        if row is None:
+            placeholders = ", ".join("?" for _ in COLUMNS)
+            self.conn.execute(
+                f"INSERT INTO scans ({', '.join(COLUMNS)}) "
+                f"VALUES ({placeholders})", [d[c] for c in COLUMNS])
+            self.conn.commit()
+            return "new"
+        if row["edited"]:
+            return "preserved"
+        non_pk = [c for c in COLUMNS if c != "csv_path"]
+        set_clause = ", ".join(f"{c}=?" for c in non_pk)
+        self.conn.execute(
+            f"UPDATE scans SET {set_clause} WHERE csv_path=?",
+            [d[c] for c in non_pk] + [m.csv_path])
+        self.conn.commit()
+        return "updated"
+
     def update_cell(self, csv_path: str, column: str, value):
         if column not in COLUMNS or column == "csv_path":
             return
-        self.conn.execute(f"UPDATE scans SET {column}=? WHERE csv_path=?",
-                          (value, csv_path))
+        # Mark the row as manually edited so the next re-ingest preserves it.
+        # COLUMNS doesn't contain 'edited', so this path is the only way the
+        # flag gets set to 1 (other than a fresh INSERT, which sets 0).
+        self.conn.execute(
+            f"UPDATE scans SET {column}=?, edited=1 WHERE csv_path=?",
+            (value, csv_path))
         self.conn.commit()
 
     def query(self, where: str = "", params: tuple = ()):
@@ -256,6 +308,9 @@ class MainWindow(QMainWindow):
         # Staging table edits are gated by this flag. Default off so a stray
         # double-click can't overwrite a parsed value silently.
         self.edit_mode = False
+        # In-memory buffer of staged edits, keyed by (csv_path, column).
+        # Nothing reaches SQLite until on_save_edits / on_save_and_exit runs.
+        self.pending_edits: dict[tuple[str, str], str] = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -299,20 +354,53 @@ class MainWindow(QMainWindow):
     _STAGING_TITLE_EDITING  = ("Staging Area  "
                                "(EDITING - changes save to database)")
 
+    # Pending-edit cell tint (light yellow) -- makes staged-but-uncommitted
+    # changes obvious before they hit the DB.
+    _PENDING_TINT = QColor("#fff3cd")
+
     def _build_staging_table(self):
         self.staging_box = QGroupBox(self._STAGING_TITLE_READONLY)
         v = QVBoxLayout(self.staging_box)
 
-        # Header row: Edit toggle right-aligned above the table.
+        # Header row: [ toast ][ stretch ][ Edit  OR  Save / Cancel / Save&Exit ].
+        # The toast and the trio live alongside the Edit button; visibility is
+        # toggled so they occupy the same conceptual slot on the right.
         header = QHBoxLayout()
+
+        self.toast = QLabel()
+        self.toast.setStyleSheet(
+            "background:#27ae60;color:white;padding:4px 10px;"
+            "border-radius:4px;font-weight:bold;")
+        self.toast.hide()
+        header.addWidget(self.toast)
         header.addStretch(1)
+
         self.edit_btn = QPushButton("Edit")
-        self.edit_btn.setCheckable(True)
         self.edit_btn.setToolTip(
-            "Toggle staging-table editing. While off, cells cannot be changed "
-            "and nothing writes to the database.")
-        self.edit_btn.toggled.connect(self.on_toggle_edit)
+            "Enter edit mode. Cells stage in memory; nothing reaches the "
+            "database until you click Save or Save & Exit.")
+        self.edit_btn.clicked.connect(self.on_enter_edit)
         header.addWidget(self.edit_btn)
+
+        # Trio container: occupies the same slot, hidden until Edit is clicked.
+        self.edit_trio = QWidget()
+        trio = QHBoxLayout(self.edit_trio)
+        trio.setContentsMargins(0, 0, 0, 0)
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setToolTip("Commit staged edits to the database. Stays in edit mode.")
+        self.save_btn.clicked.connect(self.on_save_edits)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Discard staged edits and exit edit mode.")
+        self.cancel_btn.clicked.connect(self.on_cancel_edits)
+        self.save_exit_btn = QPushButton("Save && Exit")
+        self.save_exit_btn.setToolTip("Commit staged edits and exit edit mode.")
+        self.save_exit_btn.clicked.connect(self.on_save_and_exit)
+        trio.addWidget(self.save_btn)
+        trio.addWidget(self.cancel_btn)
+        trio.addWidget(self.save_exit_btn)
+        self.edit_trio.hide()
+        header.addWidget(self.edit_trio)
+
         v.addLayout(header)
 
         self.table = QTableWidget()
@@ -372,7 +460,7 @@ class MainWindow(QMainWindow):
         g.addWidget(self.f_temp, 4, 1)
 
         apply_btn = QPushButton("Apply Filters")
-        apply_btn.clicked.connect(self.refresh_table)
+        apply_btn.clicked.connect(self.on_apply_filters)
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.on_clear_filters)
         g.addWidget(apply_btn, 5, 0)
@@ -445,22 +533,31 @@ class MainWindow(QMainWindow):
         self.log_box.append(msg)
 
     def on_browse(self):
+        if not self._guard_pending():
+            return
         folder = QFileDialog.getExistingDirectory(self, "Select CSV folder")
         if not folder:
             return
         self.path_field.setText(folder)
-        ok = err = 0
+        new = updated = preserved = err = 0
         for fn in os.listdir(folder):
             if not fn.lower().endswith(".csv"):
                 continue
             full = os.path.join(folder, fn)
             try:
-                self.db.upsert(parse_filename(full))
-                ok += 1
+                result = self.db.upsert_preserving_edits(parse_filename(full))
+                if result == "new":
+                    new += 1
+                elif result == "updated":
+                    updated += 1
+                elif result == "preserved":
+                    preserved += 1
             except Exception as e:
                 err += 1
                 self.log(f"  parse fail: {fn}  ->  {e}")
-        self.log(f"Ingested {ok} file(s), {err} unparsed.")
+        self.log(
+            f"Ingested: {new} new, {updated} updated, "
+            f"{preserved} preserved (manually edited), {err} unparsed.")
         self.refresh_filter_options()
         self.refresh_table()
 
@@ -623,12 +720,19 @@ class MainWindow(QMainWindow):
         return " AND ".join(clauses), tuple(params)
 
     def on_clear_filters(self):
+        if not self._guard_pending():
+            return
         self.f_solvent.setCurrentIndex(0)
         self.comp_group.button(0).setChecked(True)
         self.state_group.button(0).setChecked(True)
         self.f_config.setCurrentIndex(0)
         self.f_temp.setCurrentIndex(0)
         self._toggle_conditional()
+        self.refresh_table()
+
+    def on_apply_filters(self):
+        if not self._guard_pending():
+            return
         self.refresh_table()
 
     def refresh_table(self):
@@ -650,21 +754,28 @@ class MainWindow(QMainWindow):
         self.log(f"Showing {len(self.current_rows)} scan(s).")
 
     def on_cell_edited(self, item: QTableWidgetItem):
+        """Stage the change in the in-memory buffer + tint the cell.
+
+        Only fires when a cell is actually editable (edit mode on, not csv_path),
+        so on_save_edits/on_save_and_exit is the only path that reaches SQLite.
+        """
         row = item.row()
         col = COLUMNS[item.column()]
         csv_path = self.current_rows[row]["csv_path"]
-        self.db.update_cell(csv_path, col, item.text())
-        self.current_rows[row][col] = item.text()
-        self.log(f"Updated {col} for {Path(csv_path).name}")
+        self.pending_edits[(csv_path, col)] = item.text()
+        # Tint without retriggering itemChanged.
+        self.table.blockSignals(True)
+        try:
+            item.setBackground(QBrush(self._PENDING_TINT))
+        finally:
+            self.table.blockSignals(False)
 
-    def on_toggle_edit(self, checked: bool):
-        """Flip edit mode and apply the new editable state to existing items
-        in place -- no DB reload. csv_path stays locked in either mode.
+    # ------- edit-mode transitions ----------------------------------------
+    def _apply_edit_flags(self):
+        """Flip ItemIsEditable in place according to self.edit_mode.
+        csv_path stays locked regardless. blockSignals so flag flips never
+        masquerade as data edits.
         """
-        self.edit_mode = checked
-
-        # Block itemChanged so flag flips can't be mistaken for a data edit
-        # and trigger an accidental DB write.
         self.table.blockSignals(True)
         try:
             for r in range(self.table.rowCount()):
@@ -682,18 +793,144 @@ class MainWindow(QMainWindow):
         finally:
             self.table.blockSignals(False)
 
-        # Visual cue so the user always knows which mode they're in.
-        if self.edit_mode:
-            self.edit_btn.setText("Editing - click to lock")
-            self.edit_btn.setStyleSheet(
-                "background:#f1c40f;color:black;font-weight:bold;")
-            self.staging_box.setTitle(self._STAGING_TITLE_EDITING)
-            self.log("Edit mode ON - cell changes will save to the database.")
-        else:
-            self.edit_btn.setText("Edit")
-            self.edit_btn.setStyleSheet("")
-            self.staging_box.setTitle(self._STAGING_TITLE_READONLY)
-            self.log("Edit mode OFF - staging table is read-only.")
+    def _enter_edit_mode(self):
+        self.edit_mode = True
+        self._apply_edit_flags()
+        self.edit_btn.hide()
+        self.edit_trio.show()
+        self.staging_box.setTitle(self._STAGING_TITLE_EDITING)
+
+    def _exit_edit_mode(self):
+        self.edit_mode = False
+        self._apply_edit_flags()
+        self.edit_trio.hide()
+        self.edit_btn.show()
+        self.staging_box.setTitle(self._STAGING_TITLE_READONLY)
+
+    def _clear_pending_tints(self):
+        """Strip the yellow tint from every cell. Called after a successful
+        save -- the data is committed, so the 'pending' visual no longer
+        applies. blockSignals around it so background changes don't trigger
+        itemChanged.
+        """
+        self.table.blockSignals(True)
+        try:
+            for r in range(self.table.rowCount()):
+                for c in range(self.table.columnCount()):
+                    item = self.table.item(r, c)
+                    if item is not None:
+                        item.setBackground(QBrush())
+        finally:
+            self.table.blockSignals(False)
+
+    # ------- button handlers ----------------------------------------------
+    def on_enter_edit(self):
+        self._enter_edit_mode()
+        self.log("Edit mode ON - cell changes stage in memory until you Save.")
+
+    def on_save_edits(self) -> bool:
+        """Commit pending_edits to SQLite in one transaction. Sets edited=1 on
+        each affected row. On success: clears the buffer + tints, shows toast,
+        logs, stays in edit mode. Returns True on success (including the
+        zero-pending case), False on DB error.
+        """
+        count = len(self.pending_edits)
+        if count == 0:
+            msg = "No changes to save."
+            self._show_toast(msg)
+            self.log(msg)
+            return True
+
+        # Group edits by row so one UPDATE per row, all in a single transaction.
+        by_path: dict[str, dict[str, str]] = {}
+        for (csv_path, col), val in self.pending_edits.items():
+            by_path.setdefault(csv_path, {})[col] = val
+
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("BEGIN")
+            for path, cols in by_path.items():
+                set_parts = [f"{c}=?" for c in cols] + ["edited=1"]
+                values = list(cols.values()) + [path]
+                cur.execute(
+                    f"UPDATE scans SET {', '.join(set_parts)} WHERE csv_path=?",
+                    values)
+            self.db.conn.commit()
+        except Exception as e:
+            self.db.conn.rollback()
+            self.log(f"Save failed: {e}")
+            self._show_toast(f"Save failed: {e}", success=False)
+            return False
+
+        # Mirror writes into current_rows so subsequent in-memory reads agree.
+        for row in self.current_rows:
+            p = row["csv_path"]
+            if p in by_path:
+                for c, v in by_path[p].items():
+                    row[c] = v
+
+        self.pending_edits.clear()
+        self._clear_pending_tints()
+        msg = f"Saved {count} change(s)."
+        self._show_toast(msg)
+        self.log(msg)
+        return True
+
+    def on_save_and_exit(self):
+        if self.on_save_edits():
+            self._exit_edit_mode()
+
+    def on_cancel_edits(self):
+        n = len(self.pending_edits)
+        self.pending_edits.clear()
+        self._exit_edit_mode()
+        # Reload from DB to revert the displayed values (and naturally clear
+        # any tints by rebuilding every QTableWidgetItem).
+        self.refresh_table()
+        if n:
+            self.log(f"Discarded {n} change(s).")
+
+    # ------- toast + unsaved-changes guard --------------------------------
+    def _show_toast(self, text: str, success: bool = True):
+        color = "#27ae60" if success else "#c0392b"
+        self.toast.setStyleSheet(
+            f"background:{color};color:white;padding:4px 10px;"
+            f"border-radius:4px;font-weight:bold;")
+        self.toast.setText(text)
+        self.toast.show()
+        # Each call schedules its own hide; later calls just push the deadline
+        # out -- harmless if the user spams Save.
+        QTimer.singleShot(2000, self.toast.hide)
+
+    def _guard_pending(self) -> bool:
+        """Return True if the caller may proceed past a destructive action
+        (filter change, browse, etc.). If there are pending edits, prompt
+        Save / Discard / Cancel-the-action and return accordingly.
+        """
+        if not self.pending_edits:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Unsaved changes")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(
+            f"You have {len(self.pending_edits)} unsaved change(s) in the "
+            f"staging table.")
+        box.setInformativeText(
+            "Save them to the database, discard them, or cancel this action?")
+        save_btn = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("Cancel action", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return self.on_save_edits()
+        if clicked is discard_btn:
+            self.pending_edits.clear()
+            # Caller is about to rebuild the table (refresh_table / on_browse),
+            # which will rebuild items without tints.
+            return True
+        return False
 
     def on_run(self):
         signals = [name for chk, name in
