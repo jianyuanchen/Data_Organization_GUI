@@ -41,6 +41,21 @@ DEFAULT_ANNEAL_TIME = 10          # minutes; not stored in filename
 SOLVENTS = ["CB", "DCB", "Tol"]   # controlled vocabulary
 
 
+def canon_path(p: str) -> str:
+    """Canonical spelling used as the scans.csv_path primary key.
+
+    Collapses '/' vs '\\', '.' / '..' segments, relative-vs-absolute, and
+    case differences (via normcase on Windows) into ONE string. Two paths
+    that name the same file always produce the same key, so one file can
+    only ever produce one row in `scans`.
+
+    Applied at every entry point that lands a path into the DB or looks one
+    up. The parser itself still works from the ORIGINAL path's stem so
+    regex matches like 'AP'/'AN' aren't broken by the Windows lowercasing.
+    """
+    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+
 # ----------------------------------------------------------------------------
 # 1. Filename parsing  ->  metadata
 # ----------------------------------------------------------------------------
@@ -173,7 +188,7 @@ def parse_filename(path: str) -> Meta:
     n = 1 if p2 == "None" else 2
 
     return Meta(
-        csv_path=path, series=series,
+        csv_path=canon_path(path), series=series,
         p1_name=p1, p1_backbone=p1b, p1_chirality=p1c, p1_hand=p1h, p1_pct=p1p,
         p2_name=p2, p2_backbone=p2b, p2_chirality=p2c, p2_hand=p2h, p2_pct=p2p,
         n_components=n, config=_derive_config(p1c, p2c, n),
@@ -232,6 +247,83 @@ class DB:
             pass
         self.conn.commit()
 
+        # One-time (per-startup, but idempotent) migration: collapse rows whose
+        # csv_paths differ only in spelling. Stash the count so MainWindow can
+        # log it once log_box exists.
+        try:
+            self._dedup_count = self._dedupe_canonical_paths()
+        except Exception:
+            self._dedup_count = 0
+
+    def _dedupe_canonical_paths(self) -> int:
+        """Collapse rows whose csv_path differs only in slash/case/normalization.
+
+        For each group of rows sharing one canonical path:
+          - keep the one with edited=1 if any (preserve manual corrections),
+          - delete the rest,
+          - UPDATE the survivor's csv_path to the canonical form.
+
+        Idempotent: on a clean DB every group has a single row already in
+        canonical form, so no DELETE / UPDATE runs.
+
+        Returns the number of duplicate rows removed.
+        """
+        rows = self.conn.execute(
+            "SELECT csv_path, edited FROM scans").fetchall()
+        groups: dict[str, list[tuple[str, int]]] = {}
+        for row in rows:
+            key = canon_path(row["csv_path"])
+            groups.setdefault(key, []).append((row["csv_path"], row["edited"]))
+
+        removed = 0
+        for canonical, members in groups.items():
+            # Sort: edited=1 first so the manually-corrected row survives.
+            members.sort(key=lambda m: 0 if m[1] else 1)
+            survivor = members[0][0]
+            for csv_path, _ in members[1:]:
+                self.conn.execute(
+                    "DELETE FROM scans WHERE csv_path=?", (csv_path,))
+                removed += 1
+            if survivor != canonical:
+                try:
+                    self.conn.execute(
+                        "UPDATE scans SET csv_path=? WHERE csv_path=?",
+                        (canonical, survivor))
+                except sqlite3.IntegrityError:
+                    # Should be unreachable -- every group owns its canonical
+                    # key -- but if a collision sneaks in, drop the survivor
+                    # rather than letting the loop crash.
+                    self.conn.execute(
+                        "DELETE FROM scans WHERE csv_path=?", (survivor,))
+                    removed += 1
+        self.conn.commit()
+        return removed
+
+    def prune_missing(self) -> tuple[int, int]:
+        """Delete rows whose csv_path file no longer exists on disk.
+
+        Returns (total_pruned, pruned_that_were_edited). os.path.exists errors
+        are treated as 'exists' so a transient FS hiccup never wipes the row.
+        """
+        rows = self.conn.execute(
+            "SELECT csv_path, edited FROM scans").fetchall()
+        total = 0
+        edited = 0
+        for row in rows:
+            path = row["csv_path"]
+            try:
+                exists = os.path.exists(path)
+            except Exception:
+                exists = True
+            if not exists:
+                self.conn.execute(
+                    "DELETE FROM scans WHERE csv_path=?", (path,))
+                total += 1
+                if row["edited"]:
+                    edited += 1
+        self.conn.commit()
+        return total, edited
+
     def upsert(self, m: Meta):
         """Plain INSERT OR REPLACE. Clobbers the row (and resets the edited
         flag to 0). Kept for callers that explicitly want filename truth;
@@ -275,6 +367,8 @@ class DB:
     def update_cell(self, csv_path: str, column: str, value):
         if column not in COLUMNS or column == "csv_path":
             return
+        # Defensive: keys in the DB are canonical, so the lookup must be too.
+        csv_path = canon_path(csv_path)
         # Mark the row as manually edited so the next re-ingest preserves it.
         # COLUMNS doesn't contain 'edited', so this path is the only way the
         # flag gets set to 1 (other than a fresh INSERT, which sets 0).
@@ -326,6 +420,11 @@ class MainWindow(QMainWindow):
 
         self.refresh_table()
         self.refresh_filter_options()
+        # Surface the one-time DB cleanup so users know what changed under them.
+        dedup_n = getattr(self.db, "_dedup_count", 0)
+        if dedup_n:
+            self.log(
+                f"De-duplicated DB: removed {dedup_n} duplicate path row(s).")
 
     # --- top bar -----------------------------------------------------------
     def _build_top_bar(self):
@@ -336,6 +435,10 @@ class MainWindow(QMainWindow):
         self.path_field.setPlaceholderText("No folder selected")
         browse = QPushButton("Browse...")
         browse.clicked.connect(self.on_browse)
+        prune = QPushButton("Prune Missing")
+        prune.setToolTip(
+            "Delete database rows whose CSV files no longer exist on disk.")
+        prune.clicked.connect(self.on_prune_missing)
         self.origin_status = QLabel()
         self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
@@ -343,6 +446,7 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
+        h.addWidget(prune)
         h.addSpacing(20)
         h.addWidget(connect)
         h.addWidget(self.origin_status)
@@ -558,8 +662,34 @@ class MainWindow(QMainWindow):
         self.log(
             f"Ingested: {new} new, {updated} updated, "
             f"{preserved} preserved (manually edited), {err} unparsed.")
+        # Prune rows whose files are no longer on disk. Done after ingest so
+        # the row counts in the staging table match the folder.
+        self._do_prune("after browse")
         self.refresh_filter_options()
         self.refresh_table()
+
+    def on_prune_missing(self):
+        """Full-DB sweep for orphan rows. Honors the unsaved-changes guard so
+        an in-progress edit isn't silently discarded by refresh_table.
+        """
+        if not self._guard_pending():
+            return
+        self._do_prune("manual sweep")
+        self.refresh_filter_options()
+        self.refresh_table()
+
+    def _do_prune(self, source: str):
+        try:
+            pruned, pruned_edited = self.db.prune_missing()
+        except Exception as e:
+            self.log(f"Prune failed ({source}): {e}")
+            return
+        if pruned:
+            tail = (f" ({pruned_edited} was manually edited)"
+                    if pruned_edited else "")
+            self.log(f"Pruned {pruned} missing file(s){tail}.")
+        elif source == "manual sweep":
+            self.log("No missing files to prune.")
 
     # Three distinct indicator states:
     #   connected -> green   (attached + verified)
@@ -761,7 +891,10 @@ class MainWindow(QMainWindow):
         """
         row = item.row()
         col = COLUMNS[item.column()]
-        csv_path = self.current_rows[row]["csv_path"]
+        # Canonicalize defensively -- rows from the DB are already canonical,
+        # but if anything ever bypasses that, this keeps the pending key in
+        # sync with the row it must UPDATE.
+        csv_path = canon_path(self.current_rows[row]["csv_path"])
         self.pending_edits[(csv_path, col)] = item.text()
         # Tint without retriggering itemChanged.
         self.table.blockSignals(True)
