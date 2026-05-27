@@ -545,7 +545,25 @@ class MainWindow(QMainWindow):
             ["Any", "achiral+achiral", "chiral+achiral", "chiral+chiral"])
         g.addWidget(self.f_config, 2, 1)
 
-        g.addWidget(QLabel("Film state:"), 3, 0)
+        # Polymer dropdowns. All three siblings live in the grid; visibility
+        # is driven by the System radios via _toggle_conditional, so only the
+        # row(s) relevant to the current selection appear. Options are filled
+        # by _refresh_polymer_options from the actual rows in `scans`, so the
+        # dropdowns only ever offer polymers that exist in the loaded data.
+        self.lbl_polymer = QLabel("Polymer:")
+        g.addWidget(self.lbl_polymer, 3, 0)
+        self.f_polymer = QComboBox()
+        g.addWidget(self.f_polymer, 3, 1)
+        self.lbl_polymerA = QLabel("Polymer A:")
+        g.addWidget(self.lbl_polymerA, 4, 0)
+        self.f_polymerA = QComboBox()
+        g.addWidget(self.f_polymerA, 4, 1)
+        self.lbl_polymerB = QLabel("Polymer B:")
+        g.addWidget(self.lbl_polymerB, 5, 0)
+        self.f_polymerB = QComboBox()
+        g.addWidget(self.f_polymerB, 5, 1)
+
+        g.addWidget(QLabel("Film state:"), 6, 0)
         self.state_group = QButtonGroup(self)
         state_row = QHBoxLayout()
         for i, t in enumerate(["Any", "As Printed", "Annealed"]):
@@ -556,30 +574,41 @@ class MainWindow(QMainWindow):
             state_row.addWidget(rb)
         self.state_group.buttonClicked.connect(self._toggle_conditional)
         sw = QWidget(); sw.setLayout(state_row)
-        g.addWidget(sw, 3, 1)
+        g.addWidget(sw, 6, 1)
 
         self.lbl_temp = QLabel("Anneal T (°C):")
-        g.addWidget(self.lbl_temp, 4, 0)
+        g.addWidget(self.lbl_temp, 7, 0)
         self.f_temp = QComboBox()
-        g.addWidget(self.f_temp, 4, 1)
+        g.addWidget(self.f_temp, 7, 1)
 
         apply_btn = QPushButton("Apply Filters")
         apply_btn.clicked.connect(self.on_apply_filters)
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.on_clear_filters)
-        g.addWidget(apply_btn, 5, 0)
-        g.addWidget(clear_btn, 5, 1)
+        g.addWidget(apply_btn, 8, 0)
+        g.addWidget(clear_btn, 8, 1)
 
         self._toggle_conditional()
         return box
 
     def _toggle_conditional(self, *_):
-        is_two = self.comp_group.checkedId() == 2
-        self.lbl_config.setEnabled(is_two)
-        self.f_config.setEnabled(is_two)
+        # All conditional rows use setVisible so empty rows collapse out of
+        # the grid -- previously Configuration / Anneal T merely disabled,
+        # which left visible-but-grey rows in unrelated System selections.
+        cid = self.comp_group.checkedId()
+        is_one = cid == 1
+        is_two = cid == 2
+        self.lbl_config.setVisible(is_two)
+        self.f_config.setVisible(is_two)
+        self.lbl_polymer.setVisible(is_one)
+        self.f_polymer.setVisible(is_one)
+        self.lbl_polymerA.setVisible(is_two)
+        self.f_polymerA.setVisible(is_two)
+        self.lbl_polymerB.setVisible(is_two)
+        self.f_polymerB.setVisible(is_two)
         is_annealed = self.state_group.checkedId() == 2
-        self.lbl_temp.setEnabled(is_annealed)
-        self.f_temp.setEnabled(is_annealed)
+        self.lbl_temp.setVisible(is_annealed)
+        self.f_temp.setVisible(is_annealed)
 
     # --- output panel ------------------------------------------------------
     def _build_output_panel(self):
@@ -828,6 +857,48 @@ class MainWindow(QMainWindow):
         self.f_temp.clear()
         self.f_temp.addItem("Any")
         self.f_temp.addItems([str(t) for t in self.db.distinct("anneal_temp")])
+        self._refresh_polymer_options()
+
+    def _refresh_polymer_options(self):
+        """Populate polymer dropdowns from distinct values actually in scans.
+
+        - f_polymer        (1-component slot): distinct p1_name across rows
+                            with n_components=1.
+        - f_polymerA / B   (2-component slots): the UNION of distinct p1_name
+                            and p2_name across rows with n_components=2 -- a
+                            single combined list, because storage slot order
+                            (p1 vs p2) doesn't constrain which polymer the
+                            user might want to put in the A vs B box. 'None'
+                            is excluded since it's a sentinel, not a polymer.
+
+        Re-selection: stash the previous text per box and restore it after
+        the rebuild, so a refresh triggered mid-session (browse / prune)
+        doesn't silently snap the user back to 'Any'.
+        """
+        cur = self.db.conn
+        one_comp = [r[0] for r in cur.execute(
+            "SELECT DISTINCT p1_name FROM scans WHERE n_components=1 "
+            "AND p1_name IS NOT NULL ORDER BY p1_name").fetchall()]
+        two_comp = sorted({
+            r[0] for r in cur.execute(
+                "SELECT p1_name FROM scans WHERE n_components=2 "
+                "AND p1_name IS NOT NULL AND p1_name != 'None'").fetchall()
+        } | {
+            r[0] for r in cur.execute(
+                "SELECT p2_name FROM scans WHERE n_components=2 "
+                "AND p2_name IS NOT NULL AND p2_name != 'None'").fetchall()
+        })
+        for cb, items in [(self.f_polymer, one_comp),
+                          (self.f_polymerA, two_comp),
+                          (self.f_polymerB, two_comp)]:
+            prev = cb.currentText() if cb.count() else "Any"
+            cb.blockSignals(True)
+            cb.clear()
+            cb.addItem("Any")
+            cb.addItems(items)
+            idx = cb.findText(prev)
+            cb.setCurrentIndex(idx if idx >= 0 else 0)
+            cb.blockSignals(False)
 
     def _build_where(self):
         clauses, params = [], []
@@ -836,10 +907,31 @@ class MainWindow(QMainWindow):
         cid = self.comp_group.checkedId()
         if cid == 1:
             clauses.append("n_components=1")
+            poly = self.f_polymer.currentText()
+            if poly != "Any":
+                clauses.append("p1_name=?"); params.append(poly)
         elif cid == 2:
             clauses.append("n_components=2")
             if self.f_config.currentText() != "Any":
                 clauses.append("config=?"); params.append(self.f_config.currentText())
+            # Unordered 2-component pair match. Storage order (p1 vs p2) is
+            # whatever the filename produced; the filter must match the SET,
+            # not the sequence. Single-side selections match in either slot.
+            a = self.f_polymerA.currentText()
+            b = self.f_polymerB.currentText()
+            a_set = a != "Any"
+            b_set = b != "Any"
+            if a_set and b_set:
+                clauses.append(
+                    "((p1_name=? AND p2_name=?) "
+                    "OR (p1_name=? AND p2_name=?))")
+                params.extend([a, b, b, a])
+            elif a_set:
+                clauses.append("(p1_name=? OR p2_name=?)")
+                params.extend([a, a])
+            elif b_set:
+                clauses.append("(p1_name=? OR p2_name=?)")
+                params.extend([b, b])
         sid = self.state_group.checkedId()
         if sid == 1:
             clauses.append("film_state='AP'")
@@ -857,6 +949,9 @@ class MainWindow(QMainWindow):
         self.state_group.button(0).setChecked(True)
         self.f_config.setCurrentIndex(0)
         self.f_temp.setCurrentIndex(0)
+        self.f_polymer.setCurrentIndex(0)
+        self.f_polymerA.setCurrentIndex(0)
+        self.f_polymerB.setCurrentIndex(0)
         self._toggle_conditional()
         self.refresh_table()
 
