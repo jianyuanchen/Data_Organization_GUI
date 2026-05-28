@@ -119,6 +119,70 @@ Anneal *time* is not encoded in the filename — it is stored as a database tag 
 
 ---
 
+## How the Cloud Database Works
+
+The app uses two storage tiers that work together:
+
+- **Local (your machine).** A SQLite file (`cd_metadata.db`) sitting in the project folder. This is your personal working copy: everything you browse, edit, and review lives here. It's private to your machine and never shared automatically.
+- **Cloud (the lab's shared store).** A MongoDB Atlas database that holds the lab-wide, verified dataset. Atlas is a managed cloud database service — you don't run a server yourself, you just connect to it over the internet.
+
+The flow is one-way and deliberate. You parse files, review them in the verification window, and **Confirm** the ones you're sure about — all locally. Then, when you're ready, you click **Promote Selected to Cloud** or **Promote Batch to Cloud** to upload only the confirmed records to Atlas. Records that are still pending, rejected, marked needs-work, or unparsed are never uploaded. The cloud is the *trusted store*; anything that lands there has been reviewed by a human.
+
+Each cloud record is **self-contained**. It holds all the metadata (polymer, solvent, ratio, etc.), the embedded spectral arrays (wavelength / CD / g-value / UV-Vis as numeric lists), provenance fields (who added it, when it was verified, when it was promoted), and a stable unique `record_id`. Because the spectra are embedded directly in the document, anyone with database access can retrieve a record and plot it without needing the original CSV file.
+
+Re-uploading the same record does not create a duplicate. The upload is keyed on `record_id`, so promoting a record a second time **updates** the existing cloud document instead of inserting a new one — useful when you correct a peak locally and want the cloud copy refreshed.
+
+If the cloud is unreachable or not configured yet, the app still runs fully: you can parse, review, confirm, edit, and plot locally without ever connecting to Atlas. Cloud actions just report a clear error in the log instead of working.
+
+---
+
+## Getting Database Access (for lab members)
+
+The lab admin (the project maintainer) controls who can read and write to the shared database. New lab members get a personal database user from the admin — you do **not** sign up for Atlas yourself, and you do **not** get Atlas console / admin access. Once the admin issues your credentials, you connect by pasting a connection string into a local `.env` file.
+
+### A. For the admin — creating a user for a lab member
+
+Done once per lab member, all in the MongoDB Atlas web console:
+
+1. In Atlas, go to **Security → Database Access** and click **Add New Database User**.
+2. Set a username and password for that member. Record the password securely (a password manager, an encrypted vault) and share it with the member through a secure channel — a password-manager share link, a 1Password / Bitwarden item, or in person. **Never** email, Slack, or chat the password in plaintext.
+3. Under **Database User Privileges**, assign the built-in role **"Read and write to any database"** — *not* `atlasAdmin`. This lets the member upload (insert), read (download), and update records, which is everything the app needs. It does **not** let them manage other users, change cluster or database settings, drop the database, delete data wholesale, or see billing / admin info — those stay with the admin only.
+4. In Atlas, go to **Security → Network Access** and add the member's public IP address to the IP Access List (or follow the lab's network policy, e.g. a campus subnet entry). Without this, their machine cannot reach the cluster regardless of credentials.
+
+Then hand the member: their username, their password (through a secure channel), and the connection-string template — with `<username>`, `<password>`, `<cluster>`, and `<app>` left as placeholders. They'll fill the credentials in themselves.
+
+### B. For the lab member — connecting once you have credentials
+
+1. Install the project as described in the **Installation** section above (install `uv`, clone the repo, run `uv sync`).
+2. In the project folder, copy `.env.example` to a new file named `.env`:
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+   `.env` is gitignored and will never be committed. The `.env.example` file is just a template with placeholders — safe to commit, no secrets in it.
+
+3. Open `.env` in any text editor and fill in `MONGODB_URI` with the connection string the admin gave you, replacing `<username>` and `<password>` with your own credentials. The format is:
+
+   ```
+   MONGODB_URI="mongodb+srv://<username>:<password>@<cluster>/?appName=<app>"
+   MONGODB_DB="cd_automation"
+   MONGODB_COLLECTION="samples"
+   ```
+
+   Leave `MONGODB_DB` and `MONGODB_COLLECTION` as they are unless the admin tells you otherwise.
+
+4. Launch the app (`uv run python main.py`) and click **Test Cloud Connection** in the top bar. A green **Cloud: connected** indicator with a `Connected to cd_automation.samples` log line means you're set. A red indicator means something is wrong — most often a typo in the password, an IP that hasn't been allowlisted, or a network issue. Share the log line with the admin if you can't figure it out.
+
+### A note on the connection string
+
+The `MONGODB_URI` value contains a live password. Treat `.env` like a private key:
+
+- Keep it on your machine only. Never commit it, never paste it into a chat or email, never share your screen with it open.
+- If you suspect the password has been exposed in any way — a screenshot, an accidental paste, a shared screen — tell the admin immediately so they can rotate it. A rotated password is the only safe response to exposure; "it was only visible for a second" is not.
+
+---
+
 ## Planned / Future Directions
 
 ### Near-term reliability hardening *(prioritized)*
