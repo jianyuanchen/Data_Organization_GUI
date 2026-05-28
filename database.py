@@ -25,7 +25,7 @@ _TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
               "batch_id", "review_status",
               # parse diagnostic (only set on review_status='unparsed' rows)
               "parse_error"}
-_REAL_COLS = {"speed_mm_s", "peak_g"}
+_REAL_COLS = {"speed_mm_s", "peak_g", "peak_cd", "peak_uv"}
 
 
 def _sqltype(col: str) -> str:

@@ -56,7 +56,16 @@ class Meta:
     anneal_temp: Optional[int]
     anneal_time: Optional[int]   # default tag, not from filename
     peak_g: float                # peak g-value, parsed from 'gval=' token
-    peak_wl: int                 # peak wavelength (nm)
+    peak_wl: int                 # peak wavelength for the g-value peak (nm)
+    # Computed peaks from the verification window's Find Max/Min flow.
+    # NOT filename-derived; default None and only filled in when the
+    # reviewer applies a computed value. Apply sets edited=1, so the
+    # value is preserved across re-browse via the existing preserved
+    # path -- no need to add these to _USER_FIELDS.
+    peak_cd: Optional[float] = None
+    peak_cd_wl: Optional[int] = None
+    peak_uv: Optional[float] = None
+    peak_uv_wl: Optional[int] = None
     # ---- forward-looking metadata (stored, not yet used by any logic) -------
     # Stable per-record id. Independent of csv_path so it survives file moves
     # and is the durable hook for future MongoDB / vector-DB integrations.
