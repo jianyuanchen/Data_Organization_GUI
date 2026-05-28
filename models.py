@@ -70,6 +70,13 @@ class Meta:
     verified_date: Optional[str] = None
     # Provenance for a future shared lab DB. Nullable.
     added_by: Optional[str] = None
+    # Shared identifier for the rows inserted by a single browse action.
+    # Set at INSERT time (see database.upsert_preserving_edits); rows
+    # already in the DB keep their original batch_id across re-ingestion.
+    batch_id: Optional[str] = None
+    # Per-record verification state: pending | confirmed | rejected | needs_work.
+    # Driven by the verification window; default 'pending' for new rows.
+    review_status: str = "pending"
 
 
 def classify_polymer(token: str):
@@ -94,5 +101,25 @@ COLUMNS = list(Meta.__annotations__.keys())
 # Fields that are stored + round-tripped but never shown as editable columns
 # in the staging table. Kept here so the table layout stays in sync with the
 # data model.
-HIDDEN_COLUMNS = ("record_id", "flags", "verified", "verified_date", "added_by")
+HIDDEN_COLUMNS = ("record_id", "flags", "verified", "verified_date", "added_by",
+                  "batch_id", "review_status")
 VISIBLE_COLUMNS = [c for c in COLUMNS if c not in HIDDEN_COLUMNS]
+
+
+# Row-tint hex codes per review_status. Shared between the verification
+# window's sidebar and the main staging table so the two views stay in
+# visual sync. Kept as plain strings here (no Qt dep); UI modules convert
+# to QColor at their boundary.
+#
+# `needs_work` is intentionally peach (#ffe5b4) rather than the Bootstrap
+# warning yellow used in some other UIs -- the main staging table's
+# pending-edit cell tint is #fff3cd, and we need the two visuals to stay
+# distinguishable. "" for pending means "no tint" in the main table; the
+# verification sidebar falls back to a very light gray for pending so the
+# row still reads as a real list entry.
+REVIEW_STATUS_COLORS = {
+    "pending":    "",          # no tint in the main staging table
+    "confirmed":  "#d4edda",   # light green
+    "rejected":   "#f8d7da",   # light pink / red
+    "needs_work": "#ffe5b4",   # peach -- distinct from #fff3cd pending-edit yellow
+}

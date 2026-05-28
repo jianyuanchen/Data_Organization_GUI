@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 import traceback
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
@@ -26,9 +28,19 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
 )
 
-from models import COLUMNS, VISIBLE_COLUMNS, canon_path
+from models import COLUMNS, REVIEW_STATUS_COLORS, VISIBLE_COLUMNS, canon_path
 from parser import parse_filename
 from database import DB
+
+
+def new_batch_id() -> str:
+    """ISO-timestamp-prefixed unique id for one browse-into-DB batch.
+
+    Sortable by string DESC (most-recent batch first) and collision-proof
+    even on rapid back-to-back browses thanks to the uuid suffix.
+    """
+    return (datetime.now().isoformat(timespec="seconds")
+            + "_" + uuid.uuid4().hex[:8])
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +55,23 @@ class MainWindow(QMainWindow):
         # In-memory buffer of staged edits, keyed by (csv_path, column).
         # Nothing reaches SQLite until on_save_edits / on_save_and_exit runs.
         self.pending_edits: dict[tuple[str, str], str] = {}
+        # Most recent browse batch (a string from new_batch_id). None until
+        # the user actually imports something this session; on_open_verification
+        # falls back to db.latest_batch_id() so the button still works after
+        # a fresh app launch.
+        self.latest_batch_id: str | None = None
+        # Single VerificationWindow instance, kept alive so it stays usable
+        # non-modally and so re-clicks raise the existing window instead of
+        # spawning a stack.
+        self._verification_win = None
+        # Cached QBrushes keyed by review_status -- one allocation per status,
+        # reused across every refresh_table call. Empty hex -> empty QBrush
+        # (default background), which is the "pending" row's natural look in
+        # the main staging table.
+        self._STATUS_BRUSHES = {
+            status: (QBrush(QColor(hex_code)) if hex_code else QBrush())
+            for status, hex_code in REVIEW_STATUS_COLORS.items()
+        }
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -81,6 +110,12 @@ class MainWindow(QMainWindow):
         prune.setToolTip(
             "Delete database rows whose CSV files no longer exist on disk.")
         prune.clicked.connect(self.on_prune_missing)
+        review = QPushButton("Review Imported Batch")
+        review.setToolTip(
+            "Open the verification window for the most recent batch of "
+            "imported records (or the latest batch in the DB if you haven't "
+            "browsed yet this session).")
+        review.clicked.connect(self.on_open_verification)
         self.origin_status = QLabel()
         self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
@@ -89,6 +124,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
         h.addWidget(prune)
+        h.addWidget(review)
         h.addSpacing(20)
         h.addWidget(connect)
         h.addWidget(self.origin_status)
@@ -317,13 +353,18 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self.path_field.setText(folder)
+        # One batch_id covers this entire browse. Rows actually inserted in
+        # this loop get tagged with it; updated/preserved rows keep their
+        # original batch_id (see database._USER_FIELDS).
+        batch_id = new_batch_id()
         new = updated = preserved = err = 0
         for fn in os.listdir(folder):
             if not fn.lower().endswith(".csv"):
                 continue
             full = os.path.join(folder, fn)
             try:
-                result = self.db.upsert_preserving_edits(parse_filename(full))
+                result = self.db.upsert_preserving_edits(
+                    parse_filename(full), batch_id=batch_id)
                 if result == "new":
                     new += 1
                 elif result == "updated":
@@ -336,6 +377,14 @@ class MainWindow(QMainWindow):
         self.log(
             f"Ingested: {new} new, {updated} updated, "
             f"{preserved} preserved (manually edited), {err} unparsed.")
+        # Only treat the batch as reviewable when at least one file actually
+        # landed as a new row. A re-browse of an already-known folder isn't
+        # something the reviewer cares about.
+        if new > 0:
+            self.latest_batch_id = batch_id
+            self.log(
+                f"Batch {batch_id}: {new} new record(s) "
+                f"available in Review Imported Batch.")
         # Prune rows whose files are no longer on disk. Done after ingest so
         # the row counts in the staging table match the folder.
         self._do_prune("after browse")
@@ -364,6 +413,67 @@ class MainWindow(QMainWindow):
             self.log(f"Pruned {pruned} missing file(s){tail}.")
         elif source == "manual sweep":
             self.log("No missing files to prune.")
+
+    def on_open_verification(self):
+        """Open the verification window for the most-recent batch.
+
+        Prefers the batch from this session's last on_browse; falls back to
+        the highest-sorting batch_id in the DB so the button still works at
+        app startup before any browse. Refuses gracefully if no batch
+        exists or the batch has no rows.
+        """
+        # Don't strand unsaved staging-table edits behind a new window --
+        # the verification window writes to the same scans table.
+        if not self._guard_pending():
+            return
+
+        # Reuse an already-open window if any (non-modal, kept alive).
+        if (self._verification_win is not None
+                and self._verification_win.isVisible()):
+            self._verification_win.raise_()
+            self._verification_win.activateWindow()
+            return
+
+        batch_id = self.latest_batch_id or self.db.latest_batch_id()
+        if not batch_id:
+            self.log("No batch to review. Browse a folder first.")
+            return
+        if not self.db.records_in_batch(batch_id):
+            self.log(f"Batch {batch_id} has no records to review.")
+            return
+
+        # Lazy import so the GUI module graph stays acyclic and a Phase 2b
+        # import bug in verification_window can't break the rest of the GUI.
+        try:
+            from verification_window import VerificationWindow
+        except Exception as e:
+            self.log(
+                f"Failed to open verification window: "
+                f"{type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+            return
+
+        self._verification_win = VerificationWindow(
+            self.db, batch_id, parent=self)
+        # Reload the staging table when the user closes the window. Both
+        # the QDialog.finished signal (covers accept / reject / X) and the
+        # window's own reviewFinished signal route here -- belt-and-braces
+        # against any close path that fires only one of them. _after_review
+        # is idempotent so double-firing is harmless.
+        self._verification_win.finished.connect(
+            lambda *_args: self._after_review())
+        self._verification_win.reviewFinished.connect(self._after_review)
+        self._verification_win.show()
+        self.log(f"Opened verification window for batch {batch_id}.")
+
+    def _after_review(self):
+        """Slot invoked when the verification window closes. Drops the
+        cached reference (so the next click builds a fresh window) and
+        refreshes the staging table so review_status / verified / edited
+        changes show up immediately as the new row tinting.
+        """
+        self._verification_win = None
+        self.refresh_table()
 
     # Three distinct indicator states:
     #   connected -> green   (attached + verified)
@@ -611,6 +721,7 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.current_rows))
         for r, row in enumerate(self.current_rows):
+            brush = self._brush_for_row(r)
             for c, col in enumerate(VISIBLE_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
                 item = QTableWidgetItem(val)
@@ -619,9 +730,22 @@ class MainWindow(QMainWindow):
                 # which only fires when a cell is actually editable.
                 if (col == "csv_path") or (not self.edit_mode):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # Review-status tint: green/red/peach for confirmed/rejected/
+                # needs_work, default (empty brush) for pending. Pending-edit
+                # yellow set in on_cell_edited still overrides per cell.
+                item.setBackground(brush)
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
         self.log(f"Showing {len(self.current_rows)} scan(s).")
+
+    def _brush_for_row(self, r: int) -> QBrush:
+        """The status QBrush for row r, falling back to the default brush
+        when r is out of range or review_status is missing/unknown.
+        """
+        if r < 0 or r >= len(self.current_rows):
+            return QBrush()
+        status = self.current_rows[r].get("review_status") or "pending"
+        return self._STATUS_BRUSHES.get(status, QBrush())
 
     def on_cell_edited(self, item: QTableWidgetItem):
         """Stage the change in the in-memory buffer + tint the cell.
@@ -681,18 +805,20 @@ class MainWindow(QMainWindow):
         self.staging_box.setTitle(self._STAGING_TITLE_READONLY)
 
     def _clear_pending_tints(self):
-        """Strip the yellow tint from every cell. Called after a successful
-        save -- the data is committed, so the 'pending' visual no longer
-        applies. blockSignals around it so background changes don't trigger
-        itemChanged.
+        """Strip the yellow per-cell pending-edit tint and reapply each
+        row's review-status brush. Called after a successful save -- the
+        edit is committed, so the pending visual no longer applies, but
+        the underlying status tint still does. blockSignals around it so
+        background changes don't trigger itemChanged.
         """
         self.table.blockSignals(True)
         try:
             for r in range(self.table.rowCount()):
+                brush = self._brush_for_row(r)
                 for c in range(self.table.columnCount()):
                     item = self.table.item(r, c)
                     if item is not None:
-                        item.setBackground(QBrush())
+                        item.setBackground(brush)
         finally:
             self.table.blockSignals(False)
 
