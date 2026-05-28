@@ -1,9 +1,11 @@
 """
-Verification / import review window. Non-modal QDialog for reviewing the
-records of one freshly-imported batch (the most recent browse). The
-reviewer walks through records one at a time, edits parsed fields,
-optionally focuses on parser-flagged-uncertain fields, and marks each
-record confirmed / rejected / needs-work in the local SQLite store.
+Verification / import review window. Non-modal QDialog for reviewing an
+arbitrary set of records one at a time. The caller chooses the set: a
+whole batch (Review Imported Batch) or a hand-picked subset of staging-
+table rows (Review Selected). The reviewer walks through records, edits
+parsed fields, optionally focuses on parser-flagged-uncertain fields,
+and marks each one confirmed / rejected / needs-work in the local
+SQLite store.
 
 Phase 2a: shell + workflow + local SQLite writes. No plotting yet -- a
 labeled placeholder pane on the right reserves space for the per-record
@@ -81,17 +83,21 @@ class VerificationWindow(QDialog):
     # belt-and-braces hookup).
     reviewFinished = pyqtSignal()
 
-    def __init__(self, db, batch_id: str, parent=None):
+    def __init__(self, db, records, title_suffix: str = "", parent=None):
         super().__init__(parent)
         self.db = db
-        self.batch_id = batch_id
         self.setModal(False)
-        self.setWindowTitle(f"Review Imported Batch  —  {batch_id}")
+        title = "Review Records"
+        if title_suffix:
+            title += f"  —  {title_suffix}"
+        self.setWindowTitle(title)
         self.resize(1280, 760)
 
-        # Snapshot the batch contents. Subsequent reviews mutate this list
-        # in place so navigation + status counts stay in sync with the DB.
-        self.records: list[dict] = self.db.records_in_batch(batch_id)
+        # Caller hands us the records to review (a full batch, a selected
+        # subset, anything). We work off this list in place; navigation +
+        # status counts stay in sync with what we hold here, and the DB
+        # is the durable record.
+        self.records: list[dict] = list(records)
         self.current_index: int = 0 if self.records else -1
         # Pending field edits for the currently-displayed record only.
         # Persisted to the DB by Confirm; discarded on Reject / Needs Work /
@@ -141,6 +147,17 @@ class VerificationWindow(QDialog):
         self.path_label.setWordWrap(True)
         self.path_label.setStyleSheet("color:#666;font-size:11px;")
         center_v.addWidget(self.path_label)
+
+        # Parse-error banner: shown only for unparsed rows. The filename
+        # didn't decode, so the form below is empty and read-only; the
+        # banner tells the reviewer why and what to do about it.
+        self.error_banner = QLabel()
+        self.error_banner.setWordWrap(True)
+        self.error_banner.setStyleSheet(
+            "background:#f5c6cb;color:#721c24;"
+            "padding:8px;border-radius:4px;font-weight:bold;")
+        self.error_banner.hide()
+        center_v.addWidget(self.error_banner)
 
         form_host = QWidget()
         form = QFormLayout(form_host)
@@ -348,17 +365,42 @@ class VerificationWindow(QDialog):
         self.current_index = index
         r = self.records[index]
         status = r.get("review_status") or "pending"
+        is_unparsed = status == "unparsed"
         self.record_header.setText(
             f"<b>Record {index + 1} of {len(self.records)}</b>  "
             f"&nbsp;|&nbsp; status: <code>{status}</code>")
         self.path_label.setText(r["csv_path"])
+
+        # Unparsed rows: surface the parse error, disable the form + the
+        # Confirm button. Reject and Needs Work stay enabled so the user
+        # can still triage. The fix is "rename the file outside the app
+        # and re-browse" -- not editing fields in this window.
+        if is_unparsed:
+            err = r.get("parse_error") or "(no error message stored)"
+            self.error_banner.setText(
+                f"Parse error: {err}\n"
+                f"Rename the file to match the convention and re-browse "
+                f"to create a parsed row.")
+            self.error_banner.show()
+        else:
+            self.error_banner.hide()
+
         flagged = _flagged_fields(r)
         for col, le in self.field_inputs.items():
             val = r.get(col)
             le.blockSignals(True)
             le.setText("" if val is None else str(val))
             le.blockSignals(False)
+            le.setEnabled(not is_unparsed)
             le.setStyleSheet(_FLAGGED_STYLE if col in flagged else "")
+
+        self.confirm_btn.setEnabled(not is_unparsed)
+        self.confirm_btn.setToolTip(
+            "Cannot confirm an unparsed record -- rename the file to match "
+            "the filename convention and re-browse to produce a parsed row."
+            if is_unparsed
+            else "Mark this record verified and save any field edits.")
+
         self.sidebar.setCurrentRow(index)
         self._update_progress()
 
@@ -383,6 +425,20 @@ class VerificationWindow(QDialog):
             return
         r = self.records[self.current_index]
         csv_path = r["csv_path"]
+
+        # Defence-in-depth: the Confirm button is already disabled for
+        # unparsed rows, but if anything ever invokes _apply_action(
+        # "confirmed") on one (e.g. via the close-prompt's "Confirm
+        # record" branch), refuse loudly rather than silently flipping
+        # the row to verified=1.
+        if status == "confirmed" and r.get("review_status") == "unparsed":
+            QMessageBox.warning(
+                self, "Cannot confirm unparsed record",
+                "This file's name did not match the filename convention "
+                "(see the parse error above). Rename it to a valid name "
+                "and re-browse the folder to create a parsed row; then "
+                "verify the parsed row instead.")
+            return
 
         if status == "confirmed":
             now = datetime.now().isoformat(timespec="seconds")

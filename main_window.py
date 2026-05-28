@@ -22,7 +22,8 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QAbstractItemView, QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
     QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
@@ -72,6 +73,11 @@ class MainWindow(QMainWindow):
             status: (QBrush(QColor(hex_code)) if hex_code else QBrush())
             for status, hex_code in REVIEW_STATUS_COLORS.items()
         }
+        # Active staging-table view: "ALL" or a specific batch_id. Default
+        # picked from the DB so app launch already shows the most recent
+        # batch rather than dumping every legacy row into the table.
+        last = self.db.latest_batch_id()
+        self._active_view: str = last if last else "ALL"
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -85,6 +91,10 @@ class MainWindow(QMainWindow):
         layout.addLayout(mid)
         layout.addWidget(self._build_execution_area(), stretch=2)
 
+        # Order matters: populate the View dropdown (silently) before the
+        # first refresh_table so the combo's selected item matches the
+        # initial _active_view rather than snapping to index 0.
+        self._refresh_view_options()
         self.refresh_table()
         self.refresh_filter_options()
         # Surface the one-time DB cleanup so users know what changed under them.
@@ -116,6 +126,11 @@ class MainWindow(QMainWindow):
             "imported records (or the latest batch in the DB if you haven't "
             "browsed yet this session).")
         review.clicked.connect(self.on_open_verification)
+        review_sel = QPushButton("Review Selected")
+        review_sel.setToolTip(
+            "Open the verification window for the rows currently selected "
+            "in the staging table (Ctrl/Shift-click to multi-select).")
+        review_sel.clicked.connect(self.on_review_selected)
         self.origin_status = QLabel()
         self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
@@ -125,6 +140,7 @@ class MainWindow(QMainWindow):
         h.addWidget(browse)
         h.addWidget(prune)
         h.addWidget(review)
+        h.addWidget(review_sel)
         h.addSpacing(20)
         h.addWidget(connect)
         h.addWidget(self.origin_status)
@@ -148,6 +164,21 @@ class MainWindow(QMainWindow):
         # The toast and the trio live alongside the Edit button; visibility is
         # toggled so they occupy the same conceptual slot on the right.
         header = QHBoxLayout()
+
+        # View selector: scopes the staging table to one batch (or "All").
+        # Lives in the staging header rather than the top bar because it
+        # only affects what THIS table shows -- the review buttons in the
+        # top bar still act on their own targets (latest batch / selection).
+        header.addWidget(QLabel("View:"))
+        self.view_combo = QComboBox()
+        self.view_combo.setMinimumWidth(320)
+        self.view_combo.setToolTip(
+            "Scope which records appear in the staging table. Other batches "
+            "stay in the DB; switch the dropdown or pick 'All records' to "
+            "see them.")
+        self.view_combo.currentIndexChanged.connect(self._on_view_changed)
+        header.addWidget(self.view_combo)
+        header.addSpacing(20)
 
         self.toast = QLabel()
         self.toast.setStyleSheet(
@@ -193,6 +224,13 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(VISIBLE_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
+        # Row-level multi-select so the user can Ctrl/Shift-click groups of
+        # records to feed into "Review Selected". Cell-level editing in edit
+        # mode still works -- double-click enters the cell editor.
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemChanged.connect(self.on_cell_edited)
         v.addWidget(self.table)
         return self.staging_box
@@ -353,18 +391,35 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self.path_field.setText(folder)
-        # One batch_id covers this entire browse. Rows actually inserted in
-        # this loop get tagged with it; updated/preserved rows keep their
-        # original batch_id (see database._USER_FIELDS).
+        # One batch_id covers this entire browse. Every file SEEN in the
+        # folder gets re-tagged with it -- including files whose names fail
+        # parsing, which land as placeholder "unparsed" rows so the user
+        # can see (and fix) them rather than wondering why they vanished.
         batch_id = new_batch_id()
-        new = updated = preserved = err = 0
+        new = updated = preserved = unparsed = err = 0
         for fn in os.listdir(folder):
             if not fn.lower().endswith(".csv"):
                 continue
             full = os.path.join(folder, fn)
             try:
+                meta = parse_filename(full)
+            except Exception as e:
+                # Filename didn't fit the convention. Record a placeholder
+                # row (review_status='unparsed', parse_error=msg) so the
+                # file appears in the staging table as a worklist entry
+                # for the upcoming rename pass instead of being silently
+                # dropped.
+                try:
+                    self.db.upsert_unparsed(full, str(e), batch_id=batch_id)
+                    unparsed += 1
+                except Exception as ue:
+                    err += 1
+                    self.log(
+                        f"  could not record unparsed file: {fn} -> {ue}")
+                continue
+            try:
                 result = self.db.upsert_preserving_edits(
-                    parse_filename(full), batch_id=batch_id)
+                    meta, batch_id=batch_id)
                 if result == "new":
                     new += 1
                 elif result == "updated":
@@ -373,21 +428,35 @@ class MainWindow(QMainWindow):
                     preserved += 1
             except Exception as e:
                 err += 1
-                self.log(f"  parse fail: {fn}  ->  {e}")
-        self.log(
-            f"Ingested: {new} new, {updated} updated, "
-            f"{preserved} preserved (manually edited), {err} unparsed.")
+                self.log(f"  DB write failed: {fn} -> {e}")
+        bits = [
+            f"{new} new",
+            f"{updated} updated",
+            f"{preserved} preserved (manually edited)",
+            f"{unparsed} unparsed (visible in table, flagged)",
+        ]
+        if err:
+            bits.append(f"{err} errored")
+        self.log("Ingested: " + ", ".join(bits) + ".")
         # Only treat the batch as reviewable when at least one file actually
         # landed as a new row. A re-browse of an already-known folder isn't
         # something the reviewer cares about.
-        if new > 0:
+        # Every file SEEN in this browse -- newly-inserted, refreshed,
+        # edit-preserved, or unparsed -- has now been re-tagged with this
+        # batch_id, so the staging view scoped to it mirrors exactly
+        # what's in the folder right now. Switch the active view to this
+        # batch whenever any rows were touched.
+        total_seen = new + updated + preserved + unparsed
+        if total_seen > 0:
             self.latest_batch_id = batch_id
+            self._active_view = batch_id
             self.log(
-                f"Batch {batch_id}: {new} new record(s) "
-                f"available in Review Imported Batch.")
+                f"Batch {batch_id}: {total_seen} record(s) tagged to "
+                f"this folder and available in Review Imported Batch.")
         # Prune rows whose files are no longer on disk. Done after ingest so
         # the row counts in the staging table match the folder.
         self._do_prune("after browse")
+        self._refresh_view_options()
         self.refresh_filter_options()
         self.refresh_table()
 
@@ -419,31 +488,65 @@ class MainWindow(QMainWindow):
 
         Prefers the batch from this session's last on_browse; falls back to
         the highest-sorting batch_id in the DB so the button still works at
-        app startup before any browse. Refuses gracefully if no batch
-        exists or the batch has no rows.
+        app startup before any browse.
         """
-        # Don't strand unsaved staging-table edits behind a new window --
-        # the verification window writes to the same scans table.
         if not self._guard_pending():
             return
-
-        # Reuse an already-open window if any (non-modal, kept alive).
-        if (self._verification_win is not None
-                and self._verification_win.isVisible()):
-            self._verification_win.raise_()
-            self._verification_win.activateWindow()
-            return
-
         batch_id = self.latest_batch_id or self.db.latest_batch_id()
         if not batch_id:
             self.log("No batch to review. Browse a folder first.")
             return
-        if not self.db.records_in_batch(batch_id):
+        records = self.db.records_in_batch(batch_id)
+        if not records:
             self.log(f"Batch {batch_id} has no records to review.")
             return
+        self._launch_verification_window(
+            records,
+            title_suffix=f"batch {batch_id}",
+            log_phrase=f"batch {batch_id} ({len(records)} record(s))")
 
-        # Lazy import so the GUI module graph stays acyclic and a Phase 2b
-        # import bug in verification_window can't break the rest of the GUI.
+    def on_review_selected(self):
+        """Open the verification window for the currently-selected staging
+        rows. Subset path -- whatever the user has multi-selected, that's
+        the queue. No selection -> friendly log, no window.
+        """
+        if not self._guard_pending():
+            return
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            self.log("Select one or more rows first.")
+            return
+        # selectedRows() can come back in click-order; sort by row index so
+        # the verification queue mirrors what the user sees in the table.
+        indices = sorted(idx.row() for idx in sel)
+        paths = [self.current_rows[r]["csv_path"]
+                 for r in indices
+                 if 0 <= r < len(self.current_rows)]
+        records = self.db.records_by_paths(paths)
+        if not records:
+            self.log("Selected rows have no matching records in the DB.")
+            return
+        self._launch_verification_window(
+            records,
+            title_suffix=f"selected ({len(records)} records)",
+            log_phrase=f"{len(records)} selected record(s)")
+
+    def _launch_verification_window(self, records, *,
+                                     title_suffix: str, log_phrase: str):
+        """Shared launcher used by both Review buttons. Reuses an existing
+        open window (raise to front) and wires the close signals to
+        _after_review so the staging table refreshes on exit.
+        """
+        if (self._verification_win is not None
+                and self._verification_win.isVisible()):
+            self._verification_win.raise_()
+            self._verification_win.activateWindow()
+            self.log("Verification window already open; raised to front.")
+            return
+
+        # Lazy import so the GUI module graph stays acyclic and a future
+        # plotting-pull-in by verification_window can't break the rest of
+        # the GUI just because originpro is missing.
         try:
             from verification_window import VerificationWindow
         except Exception as e:
@@ -454,17 +557,15 @@ class MainWindow(QMainWindow):
             return
 
         self._verification_win = VerificationWindow(
-            self.db, batch_id, parent=self)
-        # Reload the staging table when the user closes the window. Both
-        # the QDialog.finished signal (covers accept / reject / X) and the
-        # window's own reviewFinished signal route here -- belt-and-braces
-        # against any close path that fires only one of them. _after_review
-        # is idempotent so double-firing is harmless.
+            self.db, records, title_suffix=title_suffix, parent=self)
+        # Belt-and-braces: both signals route to the same idempotent slot.
+        # QDialog.finished covers accept / reject / X; reviewFinished is
+        # the explicit signal the window emits on Save & Close / X close.
         self._verification_win.finished.connect(
             lambda *_args: self._after_review())
         self._verification_win.reviewFinished.connect(self._after_review)
         self._verification_win.show()
-        self.log(f"Opened verification window for batch {batch_id}.")
+        self.log(f"Opened verification window for {log_phrase}.")
 
     def _after_review(self):
         """Slot invoked when the verification window closes. Drops the
@@ -473,6 +574,53 @@ class MainWindow(QMainWindow):
         changes show up immediately as the new row tinting.
         """
         self._verification_win = None
+        self.refresh_table()
+
+    # ----- view selector --------------------------------------------------
+    def _refresh_view_options(self):
+        """Repopulate the View dropdown from distinct batch_ids in the DB.
+
+        Item user-data is the actual batch_id (or "ALL"); item text is a
+        human-readable label combining the ISO timestamp, source folder,
+        and row count. Preserves current selection across rebuilds; falls
+        back to "All records" if the previously-active view has vanished
+        (e.g. all its files were pruned).
+        """
+        summary = self.db.batches_summary()
+        self.view_combo.blockSignals(True)
+        self.view_combo.clear()
+        self.view_combo.addItem("All records", "ALL")
+        for bid, folder, count in summary:
+            # batch_id format: ISO 'YYYY-MM-DDTHH:MM:SS_<uuid8>'. First 19
+            # chars are the timestamp; swap the 'T' for a space so the
+            # label reads naturally.
+            ts = bid[:19].replace("T", " ")
+            self.view_combo.addItem(
+                f"{ts}  —  {folder}  ({count})", bid)
+        idx = self.view_combo.findData(self._active_view)
+        if idx < 0:
+            # Active view no longer exists -- silently fall back to ALL.
+            self._active_view = "ALL"
+            idx = 0
+        self.view_combo.setCurrentIndex(idx)
+        self.view_combo.blockSignals(False)
+
+    def _on_view_changed(self, *_):
+        """User picked a different view. Refresh the table, guarding any
+        pending staging-table edits and reverting the combo on cancel.
+        """
+        new_view = self.view_combo.currentData() or "ALL"
+        if new_view == self._active_view:
+            return
+        if not self._guard_pending():
+            # User cancelled -- snap the combo back to the old view.
+            self.view_combo.blockSignals(True)
+            idx = self.view_combo.findData(self._active_view)
+            if idx >= 0:
+                self.view_combo.setCurrentIndex(idx)
+            self.view_combo.blockSignals(False)
+            return
+        self._active_view = new_view
         self.refresh_table()
 
     # Three distinct indicator states:
@@ -717,23 +865,43 @@ class MainWindow(QMainWindow):
 
     def refresh_table(self):
         where, params = self._build_where()
+        # Layer the active-view filter on top of the user's filter clauses.
+        # "ALL" means no scoping; otherwise restrict to that batch_id. The
+        # canonical key + dedup + prune logic still runs across the whole
+        # DB -- only the displayed slice is scoped.
+        if self._active_view and self._active_view != "ALL":
+            if where:
+                where = f"({where}) AND batch_id=?"
+            else:
+                where = "batch_id=?"
+            params = params + (self._active_view,)
         self.current_rows = self.db.query(where, params)
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.current_rows))
         for r, row in enumerate(self.current_rows):
             brush = self._brush_for_row(r)
+            # Unparsed rows carry their parse error in a tooltip so the user
+            # can hover any cell on the row and see the diagnostic without
+            # opening the verification window.
+            is_unparsed = row.get("review_status") == "unparsed"
+            tip = (f"Parse error: {row['parse_error']}"
+                   if is_unparsed and row.get("parse_error") else "")
             for c, col in enumerate(VISIBLE_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
                 item = QTableWidgetItem(val)
-                # csv_path is ALWAYS locked. Everything else is locked unless
-                # edit mode is on -- writes to the DB go through on_cell_edited
-                # which only fires when a cell is actually editable.
-                if (col == "csv_path") or (not self.edit_mode):
+                # csv_path is ALWAYS locked. Unparsed rows are locked too --
+                # they have no parsed data to edit; the user should rename
+                # the file (outside the app) and re-browse. Otherwise lock
+                # unless edit mode is on.
+                if (col == "csv_path") or is_unparsed or (not self.edit_mode):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                # Review-status tint: green/red/peach for confirmed/rejected/
-                # needs_work, default (empty brush) for pending. Pending-edit
-                # yellow set in on_cell_edited still overrides per cell.
+                # Review-status tint: green/red/peach/gray for confirmed/
+                # rejected/needs_work/unparsed, default (empty brush) for
+                # pending. Pending-edit yellow set in on_cell_edited still
+                # overrides per cell during active editing.
                 item.setBackground(brush)
+                if tip:
+                    item.setToolTip(tip)
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
         self.log(f"Showing {len(self.current_rows)} scan(s).")
@@ -941,7 +1109,8 @@ class MainWindow(QMainWindow):
         if not getattr(self, "current_rows", None):
             self.log("No scans match the current filters.")
             return
-        files = [Path(r["csv_path"]).name for r in self.current_rows]
+        files = [Path(r["csv_path"]).name for r in self.current_rows
+                 if r.get("review_status") != "unparsed"]
         self.log(f"Would process {len(files)} file(s): {', '.join(files)}")
         self.log(f"Signals: {', '.join(signals)}")
         # TODO: call cd_data_processing graphing here
@@ -959,7 +1128,14 @@ class MainWindow(QMainWindow):
         if not getattr(self, "current_rows", None):
             self.log("No scans match the current filters.")
             return
-        files = [r["csv_path"] for r in self.current_rows]
+        # Unparsed rows have no parsed signals to plot -- exclude them.
+        # build_plots reads the actual CSV columns by index, so handing it
+        # an unparsed file would either silently emit nothing or raise.
+        files = [r["csv_path"] for r in self.current_rows
+                 if r.get("review_status") != "unparsed"]
+        if not files:
+            self.log("No parseable scans in the current view to plot.")
+            return
 
         # Lazy import so the GUI still launches when originpro isn't installed.
         # Distinguish the graceful "originpro missing" case from any other

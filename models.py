@@ -74,9 +74,16 @@ class Meta:
     # Set at INSERT time (see database.upsert_preserving_edits); rows
     # already in the DB keep their original batch_id across re-ingestion.
     batch_id: Optional[str] = None
-    # Per-record verification state: pending | confirmed | rejected | needs_work.
-    # Driven by the verification window; default 'pending' for new rows.
+    # Per-record verification state: pending | confirmed | rejected |
+    # needs_work | unparsed. Driven by the verification window for the
+    # first four; 'unparsed' is set by upsert_unparsed when a filename
+    # fails parse_filename and the file is recorded as a placeholder
+    # worklist entry instead of silently dropped.
     review_status: str = "pending"
+    # Diagnostic message from parse_filename, set only on unparsed rows
+    # (review_status='unparsed') so the user can see WHY parsing failed
+    # without re-running the parser. Always None on parsed rows.
+    parse_error: Optional[str] = None
 
 
 def classify_polymer(token: str):
@@ -102,7 +109,7 @@ COLUMNS = list(Meta.__annotations__.keys())
 # in the staging table. Kept here so the table layout stays in sync with the
 # data model.
 HIDDEN_COLUMNS = ("record_id", "flags", "verified", "verified_date", "added_by",
-                  "batch_id", "review_status")
+                  "batch_id", "review_status", "parse_error")
 VISIBLE_COLUMNS = [c for c in COLUMNS if c not in HIDDEN_COLUMNS]
 
 
@@ -122,4 +129,5 @@ REVIEW_STATUS_COLORS = {
     "confirmed":  "#d4edda",   # light green
     "rejected":   "#f8d7da",   # light pink / red
     "needs_work": "#ffe5b4",   # peach -- distinct from #fff3cd pending-edit yellow
+    "unparsed":   "#d3d3d3",   # light gray -- "needs renaming, not in review flow"
 }

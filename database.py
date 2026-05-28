@@ -22,7 +22,9 @@ _TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
               # forward-looking metadata
               "record_id", "flags", "verified_date", "added_by",
               # batch + verification state
-              "batch_id", "review_status"}
+              "batch_id", "review_status",
+              # parse diagnostic (only set on review_status='unparsed' rows)
+              "parse_error"}
 _REAL_COLS = {"speed_mm_s", "peak_g"}
 
 
@@ -210,16 +212,20 @@ class DB:
 
             row missing               -> INSERT, edited=0    -> 'new'
             row exists, edited == 0   -> UPDATE from Meta    -> 'updated'
-            row exists, edited == 1   -> leave untouched     -> 'preserved'
+            row exists, edited == 1   -> leave content       -> 'preserved'
 
         On the UPDATE path, the user-metadata fields in _USER_FIELDS
         (record_id, flags, verified, verified_date, added_by, batch_id,
-        review_status) are excluded from the SET clause so they survive
-        re-ingestion -- the filename only governs filename-derived data.
+        review_status) are excluded from the filename-derived SET clause
+        so they survive re-ingestion -- the filename only governs
+        filename-derived data.
 
-        `batch_id` is applied only on the INSERT path (rows being seen for
-        the first time). Existing rows keep whatever batch_id they had when
-        first ingested.
+        `batch_id` is a re-tagging concern, intentionally handled
+        separately from the preserve semantics: when passed, it is
+        (re)applied on ALL THREE paths so a re-browse of a folder always
+        re-groups its files under the current view. The user's content
+        (edits, review_status, verification metadata, record_id) is still
+        preserved on the 'preserved' path -- only batch_id moves.
         """
         cur = self.conn.execute(
             "SELECT edited FROM scans WHERE csv_path=?", (m.csv_path,))
@@ -235,13 +241,69 @@ class DB:
             self.conn.commit()
             return "new"
         if row["edited"]:
+            # Content preserved; only re-tag the batch_id if one was
+            # passed. Nothing else is touched -- edited values,
+            # review_status, verified, record_id all stay put.
+            if batch_id is not None:
+                self.conn.execute(
+                    "UPDATE scans SET batch_id=? WHERE csv_path=?",
+                    (batch_id, m.csv_path))
+                self.conn.commit()
             return "preserved"
+        # Un-edited existing row: refresh filename-derived fields AND
+        # re-tag the batch_id when one is passed. The remaining user
+        # fields (record_id / review_status / verified / verified_date /
+        # added_by / flags) are still protected via _USER_FIELDS.
         non_pk = [c for c in COLUMNS
                   if c != "csv_path" and c not in _USER_FIELDS]
-        set_clause = ", ".join(f"{c}=?" for c in non_pk)
+        sets = [f"{c}=?" for c in non_pk]
+        vals = [d[c] for c in non_pk]
+        if batch_id is not None:
+            sets.append("batch_id=?")
+            vals.append(batch_id)
         self.conn.execute(
-            f"UPDATE scans SET {set_clause} WHERE csv_path=?",
-            [d[c] for c in non_pk] + [m.csv_path])
+            f"UPDATE scans SET {', '.join(sets)} WHERE csv_path=?",
+            vals + [m.csv_path])
+        self.conn.commit()
+        return "updated"
+
+    def upsert_unparsed(self, csv_path: str, parse_error: str,
+                        batch_id: Optional[str] = None) -> str:
+        """Record a placeholder row for a file whose filename could not be
+        parsed. Sets review_status='unparsed', stores the parse error
+        message, attaches the current batch_id, and gives the row a
+        record_id like any other.
+
+        Other columns are left NULL -- the staging table's display logic
+        renders None as empty, so mostly-empty rows are fine. Unparsed
+        rows are visible (gray tint, parse_error tooltip), excluded from
+        plotting, and the verification window refuses Confirm on them.
+
+        If a row already exists at this canonical path, only the
+        unparsed-related fields (parse_error, batch_id, review_status)
+        are touched. Everything else (record_id, manual edits, prior
+        review state) is left intact -- the parse failure shouldn't
+        clobber data the user may have entered.
+
+        Returns 'new' on INSERT, 'updated' on UPDATE.
+        """
+        canonical = canon_path(csv_path)
+        existing = self.conn.execute(
+            "SELECT csv_path FROM scans WHERE csv_path=?",
+            (canonical,)).fetchone()
+        if existing is None:
+            self.conn.execute(
+                "INSERT INTO scans "
+                "(csv_path, record_id, batch_id, parse_error, "
+                " review_status, flags, verified, edited) "
+                "VALUES (?, ?, ?, ?, 'unparsed', '', 0, 0)",
+                (canonical, str(uuid.uuid4()), batch_id, parse_error))
+            self.conn.commit()
+            return "new"
+        self.conn.execute(
+            "UPDATE scans SET parse_error=?, batch_id=?, "
+            "review_status='unparsed' WHERE csv_path=?",
+            (parse_error, batch_id, canonical))
         self.conn.commit()
         return "updated"
 
@@ -276,6 +338,45 @@ class DB:
             "SELECT * FROM scans WHERE batch_id=? ORDER BY rowid",
             (batch_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    def records_by_paths(self, csv_paths) -> list[dict]:
+        """Rows whose canonical csv_path is in csv_paths, in rowid order.
+
+        Canonicalizes every input path so callers can pass raw paths from
+        any source without worrying about case / slash differences. Empty
+        list -> empty result (no SQL "IN ()" pitfall).
+        """
+        if not csv_paths:
+            return []
+        canonical = [canon_path(p) for p in csv_paths]
+        placeholders = ",".join("?" for _ in canonical)
+        rows = self.conn.execute(
+            f"SELECT * FROM scans WHERE csv_path IN ({placeholders}) "
+            f"ORDER BY rowid",
+            tuple(canonical)).fetchall()
+        return [dict(r) for r in rows]
+
+    def batches_summary(self) -> list[tuple]:
+        """Return (batch_id, folder_name, row_count) per batch, most-recent
+        first. `folder_name` is the basename of the dirname of any row in
+        that batch -- since a browse points at one folder, this is a
+        deterministic label for the dropdown.
+        """
+        rows = self.conn.execute(
+            "SELECT batch_id, csv_path FROM scans "
+            "WHERE batch_id IS NOT NULL").fetchall()
+        agg: dict = {}
+        for r in rows:
+            bid = r["batch_id"]
+            if bid not in agg:
+                folder = os.path.basename(os.path.dirname(r["csv_path"])) \
+                    or "(unknown)"
+                agg[bid] = [folder, 0]
+            agg[bid][1] += 1
+        # batch_ids are ISO-timestamp prefixed, so plain string-sort DESC
+        # gives most-recent-first.
+        return [(bid, info[0], info[1])
+                for bid, info in sorted(agg.items(), reverse=True)]
 
     def latest_batch_id(self) -> Optional[str]:
         """Highest-sorting batch_id in the DB, or None if no batches yet.
