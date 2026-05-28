@@ -10,4 +10,6 @@ dependencies = [
     "pywin32>=306",
     "originpro>=1.1.15",
     "matplotlib>=3.8",
+    "pymongo>=4.17.0",
+    "python-dotenv>=1.2.2",
 ]
