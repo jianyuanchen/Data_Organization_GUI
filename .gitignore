@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local SQLite database (per-developer working state, not shared)
+cd_metadata.db
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+*.swp
+*.swo
+.idea/
+.vscode/
