@@ -22,7 +22,7 @@ uv pip install originpro
 The `.venv` is already present in the repository root. To run scripts directly without activating:
 
 ```powershell
-.venv\Scripts\python.exe Data_Organization_GUI.py
+.venv\Scripts\python.exe main.py
 ```
 
 ## Key Dependencies
@@ -42,16 +42,21 @@ Origin must be licensed and installed; `op.set_show(True/False)` controls whethe
 
 ## Architecture
 
-The project is in early development. The intended architecture is:
+Flat module layout (no subpackages); imports flow `main` -> `main_window` -> `{database, parser, plotting}` -> `models`.
 
-- **`Data_Organization_GUI.py`** — main entry point; will contain the GUI application (likely `tkinter` or similar) that provides controls for selecting data sources, specifying organization rules, and triggering Origin automation.
+- **`main.py`** — entry point. Builds the QApplication, instantiates `MainWindow`, and runs the event loop.
+- **`main_window.py`** — PyQt6 `MainWindow` and every GUI handler (filters, staging table, edit-mode state, Origin connect, plotting dispatch).
+- **`database.py`** — SQLite layer: schema + forward-only migrations, dedup pass, record_id backfill, prune, and the three upsert flavors.
+- **`parser.py`** — filename -> `Meta` parser.
+- **`models.py`** — pure data layer: `Meta` dataclass, `classify_polymer`, `canon_path`, and column constants (`COLUMNS`, `VISIBLE_COLUMNS`). No file/DB/Qt deps.
+- **`plotting.py`** — OriginPro automation. `build_plots`, `clear_quantities`, `quantities_for`, and the `Quantity` dataclass. Lazy-imported by `main_window` so the GUI launches without `originpro` installed.
 - **`originpro` API** — all Origin interactions (reading/writing worksheets, graphs, projects) go through this library rather than direct COM calls.
 
 ## Running
 
 ```powershell
 # Run the main application
-.venv\Scripts\python.exe Data_Organization_GUI.py
+.venv\Scripts\python.exe main.py
 
 # Quick sanity check
 .venv\Scripts\python.exe hello_world.py

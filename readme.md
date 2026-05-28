@@ -97,4 +97,4 @@ Anneal *time* is not encoded in the filename — it is stored as a database tag 
 ## Notes for Testing
 - Designed and validated against a 3-file test set; **next step is a larger real dataset** to stress-test parsing coverage, filtering, and plotting at scale.
 - Database file: `cd_metadata.db` (delete to reset to a clean state).
-- Run: `uv run python Data_Organization_GUI.py`
+- Run: `uv run python main.py`

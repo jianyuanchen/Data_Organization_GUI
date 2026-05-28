@@ -1,6 +1,6 @@
 """
-CD Data Automation GUI
-======================
+CD Data Automation -- main GUI window.
+
 Parses metadata from strictly-named CSV files, stores it in a SQLite database
 (the source of truth), lets you filter via a cascading GUI, and dispatches the
 selected scans to OriginPro for batch plotting.
@@ -10,22 +10,12 @@ Filename convention (underscore-separated):
 
     R1_C-PFBT100_S-F8BT_50x50_20CB_v0p005_AN_T160_gval=0p047_500nm
     R3_F8BT_None_100_20Tol_v0p005_AP_gval=0p042_493nm
-
-Stack: PyQt6, sqlite3 (stdlib), pywin32 (OriginPro COM, Windows only).
-Run with uv:
-    uv run python Data_Organization_GUI.py
-pyproject deps:  pyqt6  pywin32
 """
-
 from __future__ import annotations
 
 import os
-import re
-import sqlite3
 import traceback
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QBrush, QColor
@@ -36,362 +26,10 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
 )
 
-DB_PATH = "cd_metadata.db"
-DEFAULT_ANNEAL_TIME = 10          # minutes; not stored in filename
-SOLVENTS = ["CB", "DCB", "Tol"]   # controlled vocabulary
+from models import COLUMNS, VISIBLE_COLUMNS, canon_path
+from parser import parse_filename
+from database import DB
 
-
-def canon_path(p: str) -> str:
-    """Canonical spelling used as the scans.csv_path primary key.
-
-    Collapses '/' vs '\\', '.' / '..' segments, relative-vs-absolute, and
-    case differences (via normcase on Windows) into ONE string. Two paths
-    that name the same file always produce the same key, so one file can
-    only ever produce one row in `scans`.
-
-    Applied at every entry point that lands a path into the DB or looks one
-    up. The parser itself still works from the ORIGINAL path's stem so
-    regex matches like 'AP'/'AN' aren't broken by the Windows lowercasing.
-    """
-    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
-
-
-# ----------------------------------------------------------------------------
-# 1. Filename parsing  ->  metadata
-# ----------------------------------------------------------------------------
-
-@dataclass
-class Meta:
-    csv_path: str
-    series: str
-    p1_name: str
-    p1_backbone: str
-    p1_chirality: str            # achiral | main-chain | side-chain | unknown
-    p1_hand: Optional[str]       # R | S | None
-    p1_pct: Optional[int]        # side-chain chiral %
-    p2_name: str                 # "None" for single component
-    p2_backbone: Optional[str]
-    p2_chirality: Optional[str]
-    p2_hand: Optional[str]
-    p2_pct: Optional[int]
-    n_components: int
-    config: str                  # 1-comp | achiral+achiral | chiral+achiral | chiral+chiral
-    ratio: str
-    conc: int                    # mg/mL
-    solvent: str
-    film_state: str              # AP | AN
-    speed_mm_s: float
-    anneal_temp: Optional[int]
-    anneal_time: Optional[int]   # default tag, not from filename
-    peak_g: float                # peak g-value, parsed from 'gval=' token
-    peak_wl: int                 # peak wavelength (nm)
-
-
-def classify_polymer(token: str):
-    """Return (backbone, chirality, hand, pct) for a polymer token."""
-    if token == "None":
-        return (None, None, None, None)
-    # main-chain chiral, e.g. R-F8BT / S-F8BT
-    m = re.match(r"^([RS])-(.+)$", token)
-    if m:
-        return (m.group(2), "main-chain", m.group(1), None)
-    # side-chain chiral, e.g. C-PFBT100 / C-PFBT50
-    m = re.match(r"^C-([A-Za-z0-9]+?)(\d+)$", token)
-    if m:
-        return (m.group(1), "side-chain", None, int(m.group(2)))
-    # bare achiral, e.g. F8BT
-    return (token, "achiral", None, None)
-
-
-def _derive_config(p1_chir, p2_chir, n_components):
-    if n_components == 1:
-        return "1-comp"
-    def bucket(c):
-        return "achiral" if c == "achiral" else "chiral"
-    parts = sorted([bucket(p1_chir), bucket(p2_chir)])  # canonical order
-    return f"{parts[0]}+{parts[1]}"
-
-
-def parse_filename(path: str) -> Meta:
-    """Parse a CSV path into Meta. Raises ValueError on malformed names.
-
-    Convention:
-        Series _ Poly1 _ Poly2 _ Ratio _ ConcSolvent _ Speed _ State
-            [_ Temp if AN] _ Gval _ Wavelength
-
-    The last two tokens are always Gval ('gval=0p047') then Wavelength ('500nm').
-    Temp ('T###') appears only when State == 'AN'.
-    """
-    stem = Path(path).stem
-    f = stem.split("_")
-    if len(f) < 9:
-        raise ValueError(f"Too few fields ({len(f)}) in '{stem}'")
-
-    # Pull the last two tokens (Gval, Wavelength) off the end.
-    wl_tok = f.pop()           # e.g. "500nm"
-    g_tok  = f.pop()           # e.g. "gval=0p047"
-    if not wl_tok.endswith("nm"):
-        raise ValueError(f"Bad wavelength token '{wl_tok}'")
-    try:
-        peak_wl = int(wl_tok[:-2])
-    except ValueError:
-        raise ValueError(f"Bad wavelength token '{wl_tok}'")
-    if not g_tok.startswith("gval="):
-        raise ValueError(f"Bad g-value token '{g_tok}'")
-    try:
-        peak_g = float(g_tok[len("gval="):].replace("p", "."))
-    except ValueError:
-        raise ValueError(f"Bad g-value token '{g_tok}'")
-
-    # Remaining 7 tokens (AP) or 8 tokens (AN with T###).
-    if len(f) not in (7, 8):
-        raise ValueError(
-            f"Unexpected field count in '{stem}' (got {len(f) + 2} total)")
-
-    series, p1, p2, ratio, conc_solv, speed, state = f[0:7]
-    temp_tok = f[7] if len(f) > 7 else None
-
-    # conc + solvent, e.g. 20CB
-    m = re.match(r"^(\d+)([A-Za-z]+)$", conc_solv)
-    if not m:
-        raise ValueError(f"Bad conc/solvent token '{conc_solv}'")
-    conc, solvent = int(m.group(1)), m.group(2)
-
-    # speed: v0p005 -> 0.005
-    if not speed.startswith("v"):
-        raise ValueError(f"Bad speed token '{speed}'")
-    try:
-        speed_val = float(speed[1:].replace("p", "."))
-    except ValueError:
-        raise ValueError(f"Bad speed token '{speed}'")
-
-    if state not in ("AP", "AN"):
-        raise ValueError(f"Bad film state '{state}' (expected AP/AN)")
-
-    anneal_temp: Optional[int] = None
-    if state == "AN":
-        if temp_tok is None:
-            raise ValueError("Annealed film missing T### token")
-        if not temp_tok.startswith("T"):
-            raise ValueError(f"Bad temp token '{temp_tok}'")
-        try:
-            anneal_temp = int(temp_tok[1:])
-        except ValueError:
-            raise ValueError(f"Bad temp token '{temp_tok}'")
-    else:  # AP
-        if temp_tok is not None:
-            raise ValueError(
-                f"AP film should have no temp token, got '{temp_tok}'")
-
-    p1b, p1c, p1h, p1p = classify_polymer(p1)
-    p2b, p2c, p2h, p2p = classify_polymer(p2)
-    n = 1 if p2 == "None" else 2
-
-    return Meta(
-        csv_path=canon_path(path), series=series,
-        p1_name=p1, p1_backbone=p1b, p1_chirality=p1c, p1_hand=p1h, p1_pct=p1p,
-        p2_name=p2, p2_backbone=p2b, p2_chirality=p2c, p2_hand=p2h, p2_pct=p2p,
-        n_components=n, config=_derive_config(p1c, p2c, n),
-        ratio=ratio, conc=conc, solvent=solvent, film_state=state,
-        speed_mm_s=speed_val, anneal_temp=anneal_temp,
-        anneal_time=(DEFAULT_ANNEAL_TIME if state == "AN" else None),
-        peak_g=peak_g, peak_wl=peak_wl,
-    )
-
-
-# ----------------------------------------------------------------------------
-# 2. SQLite layer  (source of truth)
-# ----------------------------------------------------------------------------
-
-COLUMNS = list(Meta.__annotations__.keys())
-
-
-_TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
-              "p1_hand", "p2_name", "p2_backbone", "p2_chirality", "p2_hand",
-              "config", "ratio", "solvent", "film_state"}
-_REAL_COLS = {"speed_mm_s", "peak_g"}
-
-
-def _sqltype(col: str) -> str:
-    if col in _TEXT_COLS:
-        return "TEXT"
-    if col in _REAL_COLS:
-        return "REAL"
-    return "INTEGER"
-
-
-class DB:
-    def __init__(self, path=DB_PATH):
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
-        # Persist across runs. Fresh DB: CREATE TABLE builds the full schema.
-        # Existing DB: CREATE IF NOT EXISTS is a no-op, then ALTER TABLE ADD
-        # COLUMN migrates forward -- each call is wrapped because SQLite raises
-        # OperationalError when the column already exists, which is the normal
-        # case on every subsequent startup.
-        cols = ", ".join(f"{c} {_sqltype(c)}" for c in COLUMNS)
-        self.conn.execute(
-            f"CREATE TABLE IF NOT EXISTS scans ({cols}, "
-            f"edited INTEGER NOT NULL DEFAULT 0, "
-            f"PRIMARY KEY(csv_path))")
-        for c in COLUMNS:
-            try:
-                self.conn.execute(
-                    f"ALTER TABLE scans ADD COLUMN {c} {_sqltype(c)}")
-            except sqlite3.OperationalError:
-                pass
-        try:
-            self.conn.execute(
-                "ALTER TABLE scans ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        self.conn.commit()
-
-        # One-time (per-startup, but idempotent) migration: collapse rows whose
-        # csv_paths differ only in spelling. Stash the count so MainWindow can
-        # log it once log_box exists.
-        try:
-            self._dedup_count = self._dedupe_canonical_paths()
-        except Exception:
-            self._dedup_count = 0
-
-    def _dedupe_canonical_paths(self) -> int:
-        """Collapse rows whose csv_path differs only in slash/case/normalization.
-
-        For each group of rows sharing one canonical path:
-          - keep the one with edited=1 if any (preserve manual corrections),
-          - delete the rest,
-          - UPDATE the survivor's csv_path to the canonical form.
-
-        Idempotent: on a clean DB every group has a single row already in
-        canonical form, so no DELETE / UPDATE runs.
-
-        Returns the number of duplicate rows removed.
-        """
-        rows = self.conn.execute(
-            "SELECT csv_path, edited FROM scans").fetchall()
-        groups: dict[str, list[tuple[str, int]]] = {}
-        for row in rows:
-            key = canon_path(row["csv_path"])
-            groups.setdefault(key, []).append((row["csv_path"], row["edited"]))
-
-        removed = 0
-        for canonical, members in groups.items():
-            # Sort: edited=1 first so the manually-corrected row survives.
-            members.sort(key=lambda m: 0 if m[1] else 1)
-            survivor = members[0][0]
-            for csv_path, _ in members[1:]:
-                self.conn.execute(
-                    "DELETE FROM scans WHERE csv_path=?", (csv_path,))
-                removed += 1
-            if survivor != canonical:
-                try:
-                    self.conn.execute(
-                        "UPDATE scans SET csv_path=? WHERE csv_path=?",
-                        (canonical, survivor))
-                except sqlite3.IntegrityError:
-                    # Should be unreachable -- every group owns its canonical
-                    # key -- but if a collision sneaks in, drop the survivor
-                    # rather than letting the loop crash.
-                    self.conn.execute(
-                        "DELETE FROM scans WHERE csv_path=?", (survivor,))
-                    removed += 1
-        self.conn.commit()
-        return removed
-
-    def prune_missing(self) -> tuple[int, int]:
-        """Delete rows whose csv_path file no longer exists on disk.
-
-        Returns (total_pruned, pruned_that_were_edited). os.path.exists errors
-        are treated as 'exists' so a transient FS hiccup never wipes the row.
-        """
-        rows = self.conn.execute(
-            "SELECT csv_path, edited FROM scans").fetchall()
-        total = 0
-        edited = 0
-        for row in rows:
-            path = row["csv_path"]
-            try:
-                exists = os.path.exists(path)
-            except Exception:
-                exists = True
-            if not exists:
-                self.conn.execute(
-                    "DELETE FROM scans WHERE csv_path=?", (path,))
-                total += 1
-                if row["edited"]:
-                    edited += 1
-        self.conn.commit()
-        return total, edited
-
-    def upsert(self, m: Meta):
-        """Plain INSERT OR REPLACE. Clobbers the row (and resets the edited
-        flag to 0). Kept for callers that explicitly want filename truth;
-        on_browse uses upsert_preserving_edits instead.
-        """
-        d = asdict(m)
-        placeholders = ", ".join("?" for _ in COLUMNS)
-        self.conn.execute(
-            f"INSERT OR REPLACE INTO scans ({', '.join(COLUMNS)}) "
-            f"VALUES ({placeholders})", [d[c] for c in COLUMNS])
-        self.conn.commit()
-
-    def upsert_preserving_edits(self, m: Meta) -> str:
-        """Three-way upsert that protects manual corrections:
-
-            row missing               -> INSERT, edited=0    -> 'new'
-            row exists, edited == 0   -> UPDATE from Meta    -> 'updated'
-            row exists, edited == 1   -> leave untouched     -> 'preserved'
-        """
-        cur = self.conn.execute(
-            "SELECT edited FROM scans WHERE csv_path=?", (m.csv_path,))
-        row = cur.fetchone()
-        d = asdict(m)
-        if row is None:
-            placeholders = ", ".join("?" for _ in COLUMNS)
-            self.conn.execute(
-                f"INSERT INTO scans ({', '.join(COLUMNS)}) "
-                f"VALUES ({placeholders})", [d[c] for c in COLUMNS])
-            self.conn.commit()
-            return "new"
-        if row["edited"]:
-            return "preserved"
-        non_pk = [c for c in COLUMNS if c != "csv_path"]
-        set_clause = ", ".join(f"{c}=?" for c in non_pk)
-        self.conn.execute(
-            f"UPDATE scans SET {set_clause} WHERE csv_path=?",
-            [d[c] for c in non_pk] + [m.csv_path])
-        self.conn.commit()
-        return "updated"
-
-    def update_cell(self, csv_path: str, column: str, value):
-        if column not in COLUMNS or column == "csv_path":
-            return
-        # Defensive: keys in the DB are canonical, so the lookup must be too.
-        csv_path = canon_path(csv_path)
-        # Mark the row as manually edited so the next re-ingest preserves it.
-        # COLUMNS doesn't contain 'edited', so this path is the only way the
-        # flag gets set to 1 (other than a fresh INSERT, which sets 0).
-        self.conn.execute(
-            f"UPDATE scans SET {column}=?, edited=1 WHERE csv_path=?",
-            (value, csv_path))
-        self.conn.commit()
-
-    def query(self, where: str = "", params: tuple = ()):
-        sql = "SELECT * FROM scans"
-        if where:
-            sql += " WHERE " + where
-        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
-
-    def distinct(self, column: str):
-        return [r[0] for r in self.conn.execute(
-            f"SELECT DISTINCT {column} FROM scans ORDER BY {column}").fetchall()
-            if r[0] is not None]
-
-
-# ----------------------------------------------------------------------------
-# 3. GUI
-# ----------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -425,6 +63,10 @@ class MainWindow(QMainWindow):
         if dedup_n:
             self.log(
                 f"De-duplicated DB: removed {dedup_n} duplicate path row(s).")
+        backfill_n = getattr(self.db, "_backfill_count", 0)
+        if backfill_n:
+            self.log(
+                f"Assigned record_id to {backfill_n} legacy row(s).")
 
     # --- top bar -----------------------------------------------------------
     def _build_top_bar(self):
@@ -508,8 +150,11 @@ class MainWindow(QMainWindow):
         v.addLayout(header)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(len(COLUMNS))
-        self.table.setHorizontalHeaderLabels(COLUMNS)
+        # Hidden user-metadata columns (record_id, flags, verified, ...) are
+        # stored in the DB and round-tripped on edits, but never displayed
+        # here -- VISIBLE_COLUMNS filters them out of the staging view.
+        self.table.setColumnCount(len(VISIBLE_COLUMNS))
+        self.table.setHorizontalHeaderLabels(VISIBLE_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
         self.table.itemChanged.connect(self.on_cell_edited)
@@ -966,7 +611,7 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.current_rows))
         for r, row in enumerate(self.current_rows):
-            for c, col in enumerate(COLUMNS):
+            for c, col in enumerate(VISIBLE_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
                 item = QTableWidgetItem(val)
                 # csv_path is ALWAYS locked. Everything else is locked unless
@@ -985,7 +630,7 @@ class MainWindow(QMainWindow):
         so on_save_edits/on_save_and_exit is the only path that reaches SQLite.
         """
         row = item.row()
-        col = COLUMNS[item.column()]
+        col = VISIBLE_COLUMNS[item.column()]
         # Canonicalize defensively -- rows from the DB are already canonical,
         # but if anything ever bypasses that, this keeps the pending key in
         # sync with the row it must UPDATE.
@@ -1007,7 +652,7 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(True)
         try:
             for r in range(self.table.rowCount()):
-                for c, col in enumerate(COLUMNS):
+                for c, col in enumerate(VISIBLE_COLUMNS):
                     item = self.table.item(r, c)
                     if item is None:
                         continue
@@ -1191,11 +836,27 @@ class MainWindow(QMainWindow):
         files = [r["csv_path"] for r in self.current_rows]
 
         # Lazy import so the GUI still launches when originpro isn't installed.
+        # Distinguish the graceful "originpro missing" case from any other
+        # import / load failure -- previously every ImportError was lumped
+        # under "is originpro installed?" which silently hid real bugs
+        # (typos, renamed modules, syntax errors in plotting.py).
         try:
-            from cd_data_processing_automation_GUI_integration import (
+            from plotting import (
                 build_plots, clear_quantities, quantities_for)
         except ImportError as e:
-            self.log(f"Cannot import graphing module (is originpro installed?): {e}")
+            if getattr(e, "name", None) == "originpro":
+                self.log("OriginPro is not installed -- plotting unavailable.")
+            else:
+                self.log(
+                    f"Failed to import plotting module: "
+                    f"{type(e).__name__}: {e}")
+                self.log(traceback.format_exc())
+            return
+        except Exception as e:
+            # SyntaxError, NameError, AttributeError at module load, etc.
+            self.log(
+                f"Plotting module load failed: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
             return
 
         self.generate_btn.setEnabled(False)
@@ -1212,11 +873,15 @@ class MainWindow(QMainWindow):
                     quantities_for(["CD", "G-value", "UV-Vis"]),
                     log=self.log)
             except Exception as e:
-                self.log(f"Pre-clear failed: {e}")
+                self.log(
+                    f"Pre-clear failed: {type(e).__name__}: {e}")
+                self.log(traceback.format_exc())
             build_plots(files, quantities_for(signals), log=self.log)
             self.log("Done.")
         except Exception as e:
-            self.log(f"Plot generation failed: {e}")
+            self.log(
+                f"Plot generation failed: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
         finally:
             self.generate_btn.setText("Generate Plots")
             self.generate_btn.setEnabled(True)
@@ -1238,30 +903,31 @@ class MainWindow(QMainWindow):
             chk.setChecked(False)
             chk.blockSignals(False)
 
+        # Same distinguishing import as on_generate_plots: originpro-missing
+        # is graceful, any other ImportError / load failure is logged loudly.
         try:
-            from cd_data_processing_automation_GUI_integration import (
+            from plotting import (
                 clear_quantities, quantities_for)
         except ImportError as e:
-            self.log(f"Cannot import graphing module (is originpro installed?): {e}")
+            if getattr(e, "name", None) == "originpro":
+                self.log("OriginPro is not installed -- nothing to clear.")
+            else:
+                self.log(
+                    f"Failed to import plotting module: "
+                    f"{type(e).__name__}: {e}")
+                self.log(traceback.format_exc())
+            return
+        except Exception as e:
+            self.log(
+                f"Plotting module load failed: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
             return
 
         try:
             clear_quantities(quantities_for([signal_label]), log=self.log)
             self.log(f"Cleared {signal_label} from Origin.")
         except Exception as e:
-            self.log(f"Could not clear {signal_label} from Origin: {e}")
-
-
-def main():
-    app = QApplication([])
-    win = MainWindow()
-    win.show()
-    # Defer until after the first paint so the window appears instantly even if
-    # the COM probe takes a moment. Origin is heavy; we must never boot it just
-    # to open the GUI -- startup_origin_check uses launch=False.
-    QTimer.singleShot(0, win.startup_origin_check)
-    app.exec()
-
-
-if __name__ == "__main__":
-    main()
+            self.log(
+                f"Could not clear {signal_label} from Origin: "
+                f"{type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
