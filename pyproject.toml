@@ -1,0 +1,12 @@
+[project]
+name = "cd-data-automation"
+version = "0.1.0"
+description = "CD spectroscopy data organization and OriginPro plotting GUI for the Diao Group."
+readme = "readme.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyqt6>=6.11",
+    "pandas>=2.0",
+    "pywin32>=306",
+    "originpro>=1.1.15",
+]

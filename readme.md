@@ -6,6 +6,50 @@ A desktop application for organizing, filtering, and plotting circular dichroism
 
 ---
 
+## Requirements
+
+- **Windows only.** The plotting backend talks to OriginPro through COM via `pywin32`; neither is available on macOS or Linux.
+- **OriginPro must be installed locally** for plotting to work. The GUI itself launches without OriginPro — parsing, filtering, the staging table, and editing all work — but **Generate Plots** requires a licensed local OriginPro install.
+- **Python 3.12 or newer.** Developed against 3.14.5; 3.12 / 3.13 also work. (All four dependencies have wheels for 3.12–3.14.)
+- **[uv](https://docs.astral.sh/uv/)** for environment management and dependency installation. See the uv site for install instructions on Windows (`winget install --id=astral-sh.uv` or the PowerShell installer linked there).
+
+---
+
+## Installation
+
+```powershell
+# 1. Clone the repository
+git clone <repo-url>
+cd Data_Organization_GUI
+
+# 2. Create the virtual environment and install all dependencies from pyproject.toml
+uv sync
+```
+
+`uv sync` reads `pyproject.toml`, creates a `.venv/` in the project folder, and installs `pyqt6`, `pandas`, `pywin32`, and `originpro` into it. No manual `pip install` step is needed.
+
+If `uv sync` fails on `originpro` or `pywin32`, you're almost certainly not on Windows — see the Requirements section above.
+
+---
+
+## Running
+
+```powershell
+uv run python main.py
+```
+
+`uv run` activates the project's virtual environment for that single command, so you don't need to activate it yourself. The entry point is `main.py`.
+
+---
+
+## First Run
+
+- The app opens with **no folder loaded** — the staging table is empty.
+- Click **Browse...** to point at a folder of correctly-named CSVs (see the Filename Convention below). Every parseable file is ingested into the local SQLite database (`cd_metadata.db`, created automatically in the project folder).
+- The **Origin: not connected** indicator is normal at startup — OriginPro is heavy, so the app does not launch it until you click **Connect to Origin** or **Generate Plots**. Parsing, filtering, and editing all work whether or not Origin is connected.
+
+---
+
 ## Filename Convention
 
 All metadata is encoded in the CSV filename, underscore-separated. Hyphens appear only inside polymer names.
