@@ -70,6 +70,21 @@ class DB:
                 "ALTER TABLE scans ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        # Cloud-promotion tracking. Mirrors the `edited` pattern: lives on
+        # every row but is not part of COLUMNS / Meta -- managed only by
+        # mark_promoted after a successful Mongo upsert. promoted=1 means
+        # "this record has been copied to Atlas as of promoted_at".
+        try:
+            self.conn.execute(
+                "ALTER TABLE scans ADD COLUMN promoted "
+                "INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.conn.execute(
+                "ALTER TABLE scans ADD COLUMN promoted_at TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
         # One-time (per-startup, but idempotent) migrations. Stash counts so
@@ -388,6 +403,20 @@ class DB:
             "SELECT batch_id FROM scans WHERE batch_id IS NOT NULL "
             "ORDER BY batch_id DESC LIMIT 1").fetchone()
         return row["batch_id"] if row else None
+
+    def mark_promoted(self, csv_path: str, promoted_at: str):
+        """Flip a row's local promoted state after a successful Atlas upsert.
+
+        The cloud upsert is the source of truth for whether a doc exists in
+        Atlas; this method only records the local mirror so the UI can show
+        a marker and the user can see when it was last pushed. Idempotent --
+        calling twice just overwrites the timestamp.
+        """
+        csv_path = canon_path(csv_path)
+        self.conn.execute(
+            "UPDATE scans SET promoted=1, promoted_at=? WHERE csv_path=?",
+            (promoted_at, csv_path))
+        self.conn.commit()
 
     def set_review(self, csv_path: str, status: str, *,
                    verified: Optional[int] = None,

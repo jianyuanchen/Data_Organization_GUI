@@ -131,19 +131,49 @@ class MainWindow(QMainWindow):
             "Open the verification window for the rows currently selected "
             "in the staging table (Ctrl/Shift-click to multi-select).")
         review_sel.clicked.connect(self.on_review_selected)
+        # Cloud promote actions. Both go through the confirmed-only filter
+        # in mongo_db.promote_records, so non-confirmed rows in the queue
+        # are skipped + logged rather than pushed.
+        self.promote_batch_btn = QPushButton("Promote Batch to Cloud")
+        self.promote_batch_btn.setToolTip(
+            "Upload all CONFIRMED records in the current batch (or the "
+            "latest batch in the DB) to MongoDB Atlas. Non-confirmed rows "
+            "are skipped and logged.")
+        self.promote_batch_btn.clicked.connect(self.on_promote_batch)
+        self.promote_sel_btn = QPushButton("Promote Selected to Cloud")
+        self.promote_sel_btn.setToolTip(
+            "Upload the CONFIRMED rows among the currently-selected staging "
+            "rows to MongoDB Atlas. Non-confirmed rows are skipped and "
+            "logged.")
+        self.promote_sel_btn.clicked.connect(self.on_promote_selected)
         self.origin_status = QLabel()
         self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
         connect.clicked.connect(self.on_connect_origin)
+        # Cloud connection indicator. Same three-state pattern as Origin:
+        # connected (green) / neutral (gray, idle or unconfigured) / failed
+        # (red). Kicked into shape after construction by startup_cloud_check.
+        self.cloud_status = QLabel()
+        self._set_cloud_status("neutral", "Cloud: idle")
+        test_cloud = QPushButton("Test Cloud Connection")
+        test_cloud.setToolTip(
+            "Ping MongoDB Atlas to confirm credentials. Uses MONGODB_URI "
+            "from .env; if unconfigured, this just reports that.")
+        test_cloud.clicked.connect(self.on_test_cloud)
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
         h.addWidget(prune)
         h.addWidget(review)
+        h.addWidget(self.promote_batch_btn)
         h.addWidget(review_sel)
+        h.addWidget(self.promote_sel_btn)
         h.addSpacing(20)
         h.addWidget(connect)
         h.addWidget(self.origin_status)
+        h.addSpacing(10)
+        h.addWidget(test_cloud)
+        h.addWidget(self.cloud_status)
         return box
 
     # --- staging table -----------------------------------------------------
@@ -637,6 +667,13 @@ class MainWindow(QMainWindow):
         self.origin_status.setStyleSheet(
             f"background:{color};color:white;border-radius:4px;")
 
+    def _set_cloud_status(self, state: str, text: str):
+        """Same three-state indicator pattern as Origin -- different label."""
+        color = self._STATUS_COLORS.get(state, "#c0392b")
+        self.cloud_status.setText(f"  {text}  ")
+        self.cloud_status.setStyleSheet(
+            f"background:{color};color:white;border-radius:4px;")
+
     def _connect_origin(self, launch: bool, verbose: bool = True):
         """Attach to Origin and verify. Two modes:
 
@@ -744,6 +781,155 @@ class MainWindow(QMainWindow):
     def on_connect_origin(self):
         """User clicked Connect: attach if running, otherwise launch Origin."""
         self._connect_origin(launch=True)
+
+    # ----- cloud (MongoDB Atlas) ------------------------------------------
+    def on_test_cloud(self):
+        """Ping Atlas. Updates the cloud_status indicator + logs the result.
+
+        Wrapped so a missing pymongo / config import never reaches the GUI;
+        the user just sees a 'failed' indicator and a clear log line.
+        """
+        self._set_cloud_status("neutral", "Cloud: testing...")
+        QApplication.processEvents()
+        try:
+            from mongo_db import test_connection
+        except Exception as e:
+            self._set_cloud_status("failed", "Cloud: import failed")
+            self.log(f"Cloud import failed: {type(e).__name__}: {e}")
+            return
+        try:
+            ok, msg = test_connection()
+        except Exception as e:
+            # test_connection is meant to never raise, but belt-and-braces.
+            self._set_cloud_status("failed", "Cloud: error")
+            self.log(f"Cloud test error: {type(e).__name__}: {e}")
+            return
+        if ok:
+            self._set_cloud_status("connected", "Cloud: connected")
+            self.log(f"Cloud: {msg}")
+        else:
+            self._set_cloud_status("failed", "Cloud: not connected")
+            self.log(f"Cloud: {msg}")
+
+    def on_promote_batch(self):
+        """Promote all confirmed records in the currently-viewed batch.
+
+        'Viewed batch' = the active View dropdown selection if it's a real
+        batch_id, else the most recent batch (session > DB). 'All records'
+        view falls back to the latest batch -- promoting every confirmed
+        row across history is too easy to trigger by accident.
+        """
+        if not self._guard_pending():
+            return
+        if self._active_view and self._active_view != "ALL":
+            batch_id = self._active_view
+        else:
+            batch_id = self.latest_batch_id or self.db.latest_batch_id()
+        if not batch_id:
+            self.log("No batch to promote. Browse a folder first.")
+            return
+        records = self.db.records_in_batch(batch_id)
+        if not records:
+            self.log(f"Batch {batch_id} has no records.")
+            return
+        self._run_promote(records, source=f"batch {batch_id}")
+
+    def on_promote_selected(self):
+        """Promote the currently-selected staging rows (confirmed ones only).
+        """
+        if not self._guard_pending():
+            return
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            self.log("Select one or more rows first.")
+            return
+        indices = sorted(idx.row() for idx in sel)
+        paths = [self.current_rows[r]["csv_path"]
+                 for r in indices
+                 if 0 <= r < len(self.current_rows)]
+        records = self.db.records_by_paths(paths)
+        if not records:
+            self.log("Selected rows have no matching records in the DB.")
+            return
+        self._run_promote(records, source=f"selection ({len(records)})")
+
+    def _run_promote(self, records, *, source: str):
+        """Shared driver for both promote buttons. Blocks the promote buttons,
+        flips the cloud indicator to 'promoting', calls mongo_db, then
+        mirrors successful upserts into the local DB and refreshes the
+        staging table so the ↑ marker appears.
+
+        Stays on the main thread -- the network op blocks briefly, like
+        Origin. Caller-side processEvents keeps the UI responsive for
+        users with many rows.
+        """
+        # Lazy import so the GUI still launches without pymongo / .env.
+        try:
+            from mongo_db import promote_records
+        except Exception as e:
+            self.log(f"Cloud import failed: {type(e).__name__}: {e}")
+            self._set_cloud_status("failed", "Cloud: import failed")
+            return
+
+        self.promote_batch_btn.setEnabled(False)
+        self.promote_sel_btn.setEnabled(False)
+        old_text_b = self.promote_batch_btn.text()
+        old_text_s = self.promote_sel_btn.text()
+        self.promote_batch_btn.setText("Promoting...")
+        self.promote_sel_btn.setText("Promoting...")
+        self._set_cloud_status("neutral", "Cloud: promoting...")
+        # Pre-count confirmed so the user sees what's about to be attempted.
+        n_conf = sum(1 for r in records
+                     if r.get("review_status") == "confirmed"
+                     and r.get("verified"))
+        self.log(
+            f"Promoting {n_conf} confirmed record(s) from {source} "
+            f"(of {len(records)} total)...")
+        QApplication.processEvents()
+
+        summary = {"pushed": 0, "updated": 0, "skipped": 0, "failed": 0,
+                   "promoted": []}
+        try:
+            summary = promote_records(records, log=self.log)
+        except Exception as e:
+            # promote_records is meant to never raise, but if pymongo throws
+            # something unexpected we still need to recover the UI state.
+            self.log(
+                f"Promote failed unexpectedly: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+        finally:
+            self.promote_batch_btn.setText(old_text_b)
+            self.promote_sel_btn.setText(old_text_s)
+            self.promote_batch_btn.setEnabled(True)
+            self.promote_sel_btn.setEnabled(True)
+
+        # Mirror cloud upserts into the local DB. Done outside the try/except
+        # so a partial network failure still records what DID land.
+        for csv_path, promoted_at in summary["promoted"]:
+            try:
+                self.db.mark_promoted(csv_path, promoted_at)
+            except Exception as e:
+                self.log(
+                    f"  could not mark promoted locally for {csv_path}: "
+                    f"{type(e).__name__}: {e}")
+
+        self.log(
+            f"Promote summary: pushed {summary['pushed']}, "
+            f"updated {summary['updated']}, "
+            f"skipped {summary['skipped']} (not confirmed), "
+            f"failed {summary['failed']}.")
+
+        # Indicator: success if anything landed AND nothing failed; neutral
+        # if there was simply nothing eligible; failed otherwise.
+        landed = summary["pushed"] + summary["updated"]
+        if summary["failed"]:
+            self._set_cloud_status("failed", "Cloud: errors (see log)")
+        elif landed > 0:
+            self._set_cloud_status("connected", "Cloud: connected")
+        else:
+            self._set_cloud_status("neutral", "Cloud: idle")
+
+        self.refresh_table()
 
     def startup_origin_check(self):
         """Startup probe: attach if Origin is already open, otherwise stay
@@ -886,14 +1072,24 @@ class MainWindow(QMainWindow):
             is_unparsed = row.get("review_status") == "unparsed"
             tip = (f"Parse error: {row['parse_error']}"
                    if is_unparsed and row.get("parse_error") else "")
-            # Subtle edited-row marker: a leading asterisk on the leftmost
-            # cell (csv_path), no color. Color is reserved for review_status
-            # tinting -- the two indicators are orthogonal and coexist.
+            # Subtle row markers on the leftmost cell (csv_path), no color.
+            # Color is reserved for review_status tinting -- these glyphs
+            # stay orthogonal so promoted/edited/tinted can coexist.
+            #   '*' (asterisk)  -> manually edited
+            #   '^' (caret)     -> promoted to MongoDB Atlas
+            # Both -> '^*'; neither -> no prefix.
             edited_mark = bool(row.get("edited"))
+            promoted_mark = bool(row.get("promoted"))
+            promoted_at = row.get("promoted_at") or ""
             for c, col in enumerate(VISIBLE_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
-                if c == 0 and edited_mark:
-                    val = "* " + val
+                if c == 0 and (edited_mark or promoted_mark):
+                    prefix = ""
+                    if promoted_mark:
+                        prefix += "^"
+                    if edited_mark:
+                        prefix += "*"
+                    val = prefix + " " + val
                 item = QTableWidgetItem(val)
                 # csv_path is ALWAYS locked. Unparsed rows are locked too --
                 # they have no parsed data to edit; the user should rename
@@ -906,8 +1102,14 @@ class MainWindow(QMainWindow):
                 # pending. Pending-edit yellow set in on_cell_edited still
                 # overrides per cell during active editing.
                 item.setBackground(brush)
+                # Tooltip layering: parse error wins on unparsed rows (every
+                # cell carries it). For parsed rows, the csv_path cell of a
+                # promoted record shows the last push timestamp -- hover-only
+                # surface for what the '^' glyph means.
                 if tip:
                     item.setToolTip(tip)
+                elif c == 0 and promoted_mark and promoted_at:
+                    item.setToolTip(f"Promoted to cloud: {promoted_at}")
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
         self.log(f"Showing {len(self.current_rows)} scan(s).")
