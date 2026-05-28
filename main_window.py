@@ -886,8 +886,14 @@ class MainWindow(QMainWindow):
             is_unparsed = row.get("review_status") == "unparsed"
             tip = (f"Parse error: {row['parse_error']}"
                    if is_unparsed and row.get("parse_error") else "")
+            # Subtle edited-row marker: a leading asterisk on the leftmost
+            # cell (csv_path), no color. Color is reserved for review_status
+            # tinting -- the two indicators are orthogonal and coexist.
+            edited_mark = bool(row.get("edited"))
             for c, col in enumerate(VISIBLE_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
+                if c == 0 and edited_mark:
+                    val = "* " + val
                 item = QTableWidgetItem(val)
                 # csv_path is ALWAYS locked. Unparsed rows are locked too --
                 # they have no parsed data to edit; the user should rename

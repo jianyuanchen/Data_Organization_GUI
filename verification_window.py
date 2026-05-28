@@ -781,15 +781,13 @@ class VerificationWindow(QDialog):
         if peak is None:
             return
         wl, val, _kind = peak
+        # Small dot marking the peak's location on the curve. No on-curve
+        # annotation -- the value+wavelength text lives in the bottom-right
+        # corner readout (_draw_corner_readout) and the field inputs in
+        # the center pane, so duplicating it next to the dot was noise.
         marker, = ax.plot([wl], [val], "o",
-                          color="#d62728", markersize=8, zorder=6)
-        ann = ax.annotate(
-            f"{val:.4g}\n@ {wl:.0f} nm",
-            xy=(wl, val),
-            xytext=(12, -18), textcoords="offset points",
-            fontsize=9, color="#a02020",
-            arrowprops=dict(arrowstyle="->", color="#a02020", lw=1))
-        self._marker_artists[sig] = (marker, ann)
+                          color="#d62728", markersize=4, zorder=6)
+        self._marker_artists[sig] = (marker,)
 
     def _draw_corner_readout(self, sig: str):
         ax = self._sig_axes[sig]
@@ -803,7 +801,9 @@ class VerificationWindow(QDialog):
         if peak is None:
             return
         wl, val, kind = peak
-        txt = f"{kind}: {val:.4g} @ {wl:.0f} nm"
+        # "max: 9070, 491 nm" form -- no "@" so the readout reads as a
+        # plain (value, wavelength) pair.
+        txt = f"{kind}: {val:.4g}, {wl:.0f} nm"
         handle = ax.text(
             0.98, 0.04, txt,
             transform=ax.transAxes,
