@@ -1,13 +1,15 @@
-"""MongoDB Atlas push-only cloud layer.
+"""MongoDB Atlas cloud layer.
 
-Promotes confirmed local records to the configured Atlas collection. All
-secrets are read via config.py (MONGODB_URI / MONGODB_DB / MONGODB_COLLECTION
-from .env) -- never hardcoded. Every network op is guarded so a failure
-(unconfigured, DNS down, auth, timeout) is returned as a summary instead of
-bubbling up into the GUI.
+Promotes confirmed local records to the configured Atlas collection and
+fetches them back for the read-only cloud browser. All secrets are read via
+config.py (MONGODB_URI / MONGODB_DB / MONGODB_COLLECTION from .env) -- never
+hardcoded. Every network op is guarded so a failure (unconfigured, DNS down,
+auth, timeout) is returned as a summary/empty result instead of bubbling up
+into the GUI.
 
-This module is push-only by design (Phase 3). Retrieve-from-cloud will come
-in a later phase.
+Phase 3 added push (promote_records); Phase 3b adds the download counterpart
+(fetch_records) for the cloud browser. Cloud records stay read-only -- the
+only way to change one is to re-promote the corrected local record.
 """
 from __future__ import annotations
 
@@ -65,6 +67,55 @@ def test_connection() -> tuple[bool, str]:
                 client.close()
             except Exception:
                 pass
+
+
+def fetch_records(query: dict | None = None, log=print) -> list[dict]:
+    """Read records from the configured Atlas collection (read-only).
+
+    `query` is an optional MongoDB filter dict (e.g. {"solvent": "CB"}). When
+    None or empty, every document in the collection is returned. The signature
+    accepts an arbitrary filter dict from the start so richer cascading
+    filters (polymer / chirality / temperature) can be added later without
+    changing callers -- this phase only passes simple equality criteria.
+
+    Every failure mode (unconfigured, import missing, connect timeout, query
+    error) is caught: a clear message is logged and an empty list is returned
+    so the GUI never crashes on a cloud hiccup.
+
+    Each returned dict carries the document's metadata fields plus the
+    embedded spectra arrays (wavelength / cd / g / uv) exactly as stored by
+    promote_records. The Mongo ObjectId (`_id`) is stringified so callers can
+    treat the dict as plain JSON-ish data.
+    """
+    query = query or {}
+
+    if not config.mongo_configured():
+        log("MongoDB not configured -- set MONGODB_URI in .env.")
+        return []
+
+    client = None
+    try:
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        records = list(collection.find(query))
+    except Exception as e:
+        log(f"Cloud fetch failed: {type(e).__name__}: {e}")
+        return []
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # ObjectId isn't needed downstream and isn't plain-data; stringify it so
+    # the record is safe to hand around the GUI.
+    for rec in records:
+        if "_id" in rec:
+            rec["_id"] = str(rec["_id"])
+    log(f"Fetched {len(records)} cloud record(s).")
+    return records
 
 
 def _is_confirmed(rec: dict) -> bool:

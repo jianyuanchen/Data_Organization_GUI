@@ -89,6 +89,41 @@ QUANTITIES = [
 ]
 
 
+@dataclass
+class PlotData:
+    """One curve's worth of in-memory spectra for the Origin overlay path.
+
+    Decouples the graphing core from any file: a record carries its four
+    arrays directly. The file-based pipeline (build_plots) reads CSVs into
+    these; the cloud browser fills them straight from a document's embedded
+    arrays. The arrays must ALREADY be cleaned to the shared convention
+    (wavelength >= 300 nm, capped at ROW_LIMIT) -- the core does no further
+    filtering, so both sources produce identical graphs for identical data.
+
+    `label`  -> the column Comments cell, which drives the @LC legend text.
+    `log_name` / `log_detail` only shape the per-record log line; they never
+    affect the plot.
+    """
+    label: str                      # legend comment (Comments -> @LC legend)
+    wavelength: list
+    g: list
+    cd: list
+    uv: list
+    log_name: str = ""              # display name for the per-record log line
+    log_detail: str = ""            # extra text inside the "(... rows ...)" log
+
+    def __post_init__(self):
+        if not self.log_name:
+            self.log_name = self.label or "(unlabeled)"
+
+    @property
+    def cols(self):
+        # Same [wavelength, g, CD, UV] order as read_csv_columns so a
+        # Quantity.src_col (1=g, 2=CD, 3=UV; 0=wavelength) indexes the right
+        # array with no special-casing in the core.
+        return [self.wavelength, self.g, self.cd, self.uv]
+
+
 # NOTE: the sys.excepthook hook that closes Origin on crash is installed only
 # when this file is run as a script (see the `if __name__ == "__main__":`
 # block at the bottom). Installing it at import time would hijack the GUI's
@@ -289,22 +324,25 @@ def clear_quantities(quantities, log=print):
                 pass
 
 
-def build_plots(files, quantities, log=print):
-    """Build one workbook + overlay graph per quantity for the given file list.
+def build_plots_from_data(records, quantities, log=print):
+    """Core graphing path: one workbook + overlay graph per quantity, built
+    from in-memory data records rather than files.
 
-    `files` is an explicit list of CSV paths. `quantities` is any subset of
-    QUANTITIES (e.g. produced by quantities_for(...)). Output is piped through
-    `log` so the GUI can redirect it into its log box.
+    `records` is a list of PlotData (each a label + wavelength/g/cd/uv arrays
+    already cleaned to the shared convention). `quantities` is any subset of
+    QUANTITIES (e.g. produced by quantities_for(...)). Shared by the file-
+    based build_plots (which reads CSVs first) and the cloud browser (which
+    passes a document's embedded arrays), so both render identically through
+    the same overlay + style_graph styling.
 
     Must run on the main thread: originpro / COM is not reliably thread-safe.
+    Returns the number of scans actually consolidated.
     """
     if op.oext:
         op.set_show(True)
 
     # Repeat runs would otherwise accumulate 'Master CD1' / 'g-value2' duplicates.
     clear_quantities(quantities, log)
-
-    log(f"Found {len(files)} CSV file(s).")
 
     for q in quantities:                          # create the books + empty graphs
         # Capture the WBook so we can pin its SHORT name. Without this, Origin
@@ -320,23 +358,22 @@ def build_plots(files, quantities, log=print):
         q.gp.lname = q.graph_lname
 
     col, wrote_x = 1, False                        # col = next free column; X written once
-    for path in files:
-        cols = read_csv_columns(path)
-        stem = os.path.splitext(os.path.basename(path))[0]
-        if not cols:
-            log(f"  SKIPPED (no numeric data): {stem}")
+    for rec in records:
+        cols = rec.cols
+        if not cols or not cols[0]:
+            log(f"  SKIPPED (no numeric data): {rec.log_name}")
             continue
 
-        speed = parse_speed(stem)
         for q in quantities:
             if not wrote_x:
                 q.wks.from_list(0, cols[0], WAVELENGTH_LNAME, axis="X")
             ydata = cols[q.src_col]
-            q.wks.from_list(col, ydata, q.col_lname, comments=speed, axis="Y")
+            q.wks.from_list(col, ydata, q.col_lname,
+                            comments=rec.label, axis="Y")
             q.data_absmax = max(q.data_absmax, max(abs(v) for v in ydata))  # for symmetric Y
 
         wrote_x = True
-        log(f"  added: {stem}  ({len(cols[0])} rows, {speed or 'n/a'})")
+        log(f"  added: {rec.log_name}  ({len(cols[0])} rows{rec.log_detail})")
         col += 1
 
     for q in quantities:
@@ -344,6 +381,36 @@ def build_plots(files, quantities, log=print):
         style_graph(q)
 
     log(f"\nDone. {col - 1} scan(s) consolidated. Origin left open for review.")
+    return col - 1
+
+
+def build_plots(files, quantities, log=print):
+    """File-based entry point for the main staging area.
+
+    Reads each CSV into a PlotData (labelling the curve by its parsed print
+    speed) and delegates to build_plots_from_data. Behavior is unchanged from
+    when this read + graphed inline: same speed legend, same per-file log
+    lines, same plots.
+
+    `files` is an explicit list of CSV paths. `quantities` is any subset of
+    QUANTITIES. Must run on the main thread.
+    """
+    log(f"Found {len(files)} CSV file(s).")
+    records = []
+    for path in files:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        cols = read_csv_columns(path)
+        if not cols:
+            # Keep a placeholder so the core still emits the SKIPPED line by
+            # name; empty arrays make it skip without touching a column.
+            records.append(PlotData("", [], [], [], [], log_name=stem))
+            continue
+        speed = parse_speed(stem)
+        records.append(PlotData(
+            label=speed,
+            wavelength=cols[0], g=cols[1], cd=cols[2], uv=cols[3],
+            log_name=stem, log_detail=f", {speed or 'n/a'}"))
+    build_plots_from_data(records, quantities, log=log)
 
 
 # ===========================================================================

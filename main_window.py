@@ -65,6 +65,9 @@ class MainWindow(QMainWindow):
         # non-modally and so re-clicks raise the existing window instead of
         # spawning a stack.
         self._verification_win = None
+        # Single read-only CloudBrowserWindow instance, same lifecycle as the
+        # verification window (kept alive non-modally; re-clicks raise it).
+        self._cloud_browser_win = None
         # Cached QBrushes keyed by review_status -- one allocation per status,
         # reused across every refresh_table call. Empty hex -> empty QBrush
         # (default background), which is the "pending" row's natural look in
@@ -160,6 +163,12 @@ class MainWindow(QMainWindow):
             "Ping MongoDB Atlas to confirm credentials. Uses MONGODB_URI "
             "from .env; if unconfigured, this just reports that.")
         test_cloud.clicked.connect(self.on_test_cloud)
+        browse_cloud = QPushButton("Browse Cloud")
+        browse_cloud.setToolTip(
+            "Open the read-only cloud browser: fetch records from MongoDB "
+            "Atlas and plot their embedded spectra. No editing -- corrections "
+            "happen by re-promoting a local record.")
+        browse_cloud.clicked.connect(self.on_browse_cloud)
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
@@ -173,6 +182,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.origin_status)
         h.addSpacing(10)
         h.addWidget(test_cloud)
+        h.addWidget(browse_cloud)
         h.addWidget(self.cloud_status)
         return box
 
@@ -819,6 +829,42 @@ class MainWindow(QMainWindow):
         else:
             self._set_cloud_status("failed", "Cloud: not connected")
             self.log(f"Cloud: {msg}")
+
+    def on_browse_cloud(self):
+        """Open the read-only cloud browser. Reuses an existing open window
+        (raise to front) like the verification window. Fetch failures are
+        handled inside the dialog (it opens and shows a clear empty state),
+        so the app never crashes if the cloud is unconfigured/unreachable.
+        """
+        if (self._cloud_browser_win is not None
+                and self._cloud_browser_win.isVisible()):
+            self._cloud_browser_win.raise_()
+            self._cloud_browser_win.activateWindow()
+            self.log("Cloud browser already open; raised to front.")
+            return
+
+        # Lazy import so the GUI launches even if matplotlib / pymongo aren't
+        # importable -- the failure surfaces here as a log line, not a crash.
+        try:
+            from cloud_browser_window import CloudBrowserWindow
+        except Exception as e:
+            self.log(
+                f"Failed to open cloud browser: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+            return
+
+        self._cloud_browser_win = CloudBrowserWindow(log=self.log, parent=self)
+        self._cloud_browser_win.finished.connect(
+            lambda *_args: self._after_cloud_browse())
+        self._cloud_browser_win.show()
+        self.log("Opened cloud browser (read-only).")
+
+    def _after_cloud_browse(self):
+        """Drop the cached cloud-browser reference on close so the next click
+        builds a fresh window. Nothing to refresh locally -- the browser is
+        read-only and never touches the local DB.
+        """
+        self._cloud_browser_win = None
 
     def on_promote_batch(self):
         """Promote all confirmed records in the currently-viewed batch.
