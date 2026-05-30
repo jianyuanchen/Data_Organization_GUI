@@ -350,7 +350,11 @@ def build_plots(files, quantities, log=print):
 # MAIN  (standalone entry point)
 # ===========================================================================
 def main():
-    files = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
+    files = sorted(
+        f for f in glob.glob(os.path.join(DATA_DIR, "*.csv"))
+        # Skip macOS AppleDouble sidecar files ("._foo.csv") -- metadata,
+        # not real data.
+        if not os.path.basename(f).startswith("._"))
     if not files:
         print(f"No .csv files found in: {os.path.abspath(DATA_DIR)}")
         return

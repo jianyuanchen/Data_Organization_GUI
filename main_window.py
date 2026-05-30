@@ -426,9 +426,15 @@ class MainWindow(QMainWindow):
         # parsing, which land as placeholder "unparsed" rows so the user
         # can see (and fix) them rather than wondering why they vanished.
         batch_id = new_batch_id()
-        new = updated = preserved = unparsed = err = 0
+        new = updated = preserved = unparsed = err = ignored_meta = 0
         for fn in os.listdir(folder):
             if not fn.lower().endswith(".csv"):
+                continue
+            # macOS AppleDouble sidecar files ("._foo.csv") are metadata
+            # created when files pass through Mac-synced storage, not real
+            # data. Skip them entirely so they never become phantom rows.
+            if fn.startswith("._"):
+                ignored_meta += 1
                 continue
             full = os.path.join(folder, fn)
             try:
@@ -468,6 +474,9 @@ class MainWindow(QMainWindow):
         if err:
             bits.append(f"{err} errored")
         self.log("Ingested: " + ", ".join(bits) + ".")
+        if ignored_meta:
+            self.log(
+                f"Ignored {ignored_meta} macOS metadata file(s) (._*).")
         # Only treat the batch as reviewable when at least one file actually
         # landed as a new row. A re-browse of an already-known folder isn't
         # something the reviewer cares about.
