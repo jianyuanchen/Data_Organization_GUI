@@ -23,7 +23,7 @@ from PyQt6.QtGui import QBrush, QColor, QCloseEvent, QDoubleValidator
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QGroupBox, QSplitter, QCheckBox, QMessageBox, QSizePolicy,
+    QGroupBox, QSplitter, QCheckBox, QMessageBox, QSizePolicy, QScrollArea,
 )
 
 import numpy as np
@@ -114,6 +114,12 @@ class VerificationWindow(QDialog):
         if title_suffix:
             title += f"  —  {title_suffix}"
         self.setWindowTitle(title)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self.setSizeGripEnabled(True)
         self.resize(1280, 760)
 
         # Caller hands us the records to review (a full batch, a selected
@@ -193,8 +199,11 @@ class VerificationWindow(QDialog):
             le.editingFinished.connect(lambda c=col: self._on_field_edit(c))
             self.field_inputs[col] = le
             form.addRow(QLabel(col + ":"), le)
-        center_v.addWidget(form_host)
-        center_v.addStretch(1)
+        form_scroll = QScrollArea()
+        form_scroll.setWidget(form_host)
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        center_v.addWidget(form_scroll, stretch=1)
         splitter.addWidget(center_box)
 
         # ---- Plot pane: 3 sharex'd subplots + range band + peak finder ----
