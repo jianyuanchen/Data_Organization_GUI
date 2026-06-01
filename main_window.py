@@ -17,13 +17,12 @@ import os
 import traceback
 import uuid
 from datetime import datetime
-from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
     QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
@@ -87,12 +86,44 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         layout.addWidget(self._build_top_bar())
-        layout.addWidget(self._build_staging_table(), stretch=3)
-        mid = QHBoxLayout()
-        mid.addWidget(self._build_filter_panel(), stretch=2)
-        mid.addWidget(self._build_output_panel(), stretch=1)
-        layout.addLayout(mid)
-        layout.addWidget(self._build_execution_area(), stretch=2)
+
+        # Vertical splitter with three draggable sections, top to bottom:
+        #   0) staging table  -- flexible, takes most of the window
+        #   1) Filters + Output Plots  -- keeps its needed size
+        #   2) Execution / log  -- compact (~3 lines) by default, draggable
+        # The staging table and the log are the flexible regions: dragging the
+        # bottom handle taller to read more log shrinks the table, and vice
+        # versa. The middle (filters/output) holds its size hint.
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self._build_staging_table())
+
+        mid_widget = QWidget()
+        mid_layout = QHBoxLayout(mid_widget)
+        mid_layout.setContentsMargins(0, 0, 0, 0)
+        mid_layout.addWidget(self._build_filter_panel(), stretch=2)
+        mid_layout.addWidget(self._build_output_panel(), stretch=1)
+        splitter.addWidget(mid_widget)
+
+        splitter.addWidget(self._build_execution_area())
+
+        # Only the staging table absorbs extra space when the window grows,
+        # so enlarging/maximizing gives the table more rows while the filters
+        # and the log stay compact (the user can still drag any handle).
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 0)
+        # Initial heights: a generous table, the filters/output at their hint,
+        # and a ~3-line log. The first value is a placeholder -- the stretch
+        # factors route any window-vs-sum difference into the table pane.
+        splitter.setSizes([
+            640,
+            mid_widget.sizeHint().height(),
+            self._log_compact_h,
+        ])
+        # Don't let a drag collapse a section to zero; the table keeps its
+        # scroll area and the log keeps its ~1-line floor.
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, stretch=1)
 
         # Order matters: populate the View dropdown (silently) before the
         # first refresh_table so the combo's selected item matches the
@@ -272,7 +303,14 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemChanged.connect(self.on_cell_edited)
-        v.addWidget(self.table)
+        # Expand vertically so dragging the splitter (or maximizing the
+        # window) grows the visible row area instead of leaving empty space.
+        # The table keeps its own scroll bar for rows beyond what fits.
+        self.table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        v.addWidget(self.table, stretch=1)
+        self.staging_box.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         return self.staging_box
 
     # --- cascading filter panel -------------------------------------------
@@ -411,13 +449,24 @@ class MainWindow(QMainWindow):
     def _build_execution_area(self):
         box = QGroupBox("Execution")
         v = QVBoxLayout(box)
-        self.run_btn = QPushButton("Run Processing")
-        self.run_btn.clicked.connect(self.on_run)
         self.progress = QProgressBar()
         self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
-        v.addWidget(self.run_btn)
+        # Compact by default (~3 lines) so the staging table gets the room.
+        # Lives in the main vertical splitter, so the user can drag it taller
+        # to read more output; it still scrolls for content beyond what fits.
+        self.log_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        fm = self.log_box.fontMetrics()
         v.addWidget(self.progress)
         v.addWidget(self.log_box)
+        # Default pane height for the splitter: the group box's chrome
+        # (title, margins, progress bar) -- which is its size hint minus the
+        # log box's own (large) default hint -- plus an explicit 3-line log.
+        # Floor the log at ~1 line so a drag can still make it shorter.
+        three_lines = fm.lineSpacing() * 3 + 4
+        chrome = box.sizeHint().height() - self.log_box.sizeHint().height()
+        self._log_compact_h = max(chrome, 0) + three_lines
+        self.log_box.setMinimumHeight(fm.lineSpacing() + 8)
         return box
 
     # ----- behavior --------------------------------------------------------
@@ -1362,22 +1411,6 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def on_run(self):
-        signals = [name for chk, name in
-                   [(self.chk_cd, "CD"), (self.chk_g, "G-value"),
-                    (self.chk_uv, "UV-Vis")] if chk.isChecked()]
-        if not signals:
-            self.log("Select at least one plot type.")
-            return
-        if not getattr(self, "current_rows", None):
-            self.log("No scans match the current filters.")
-            return
-        files = [Path(r["csv_path"]).name for r in self.current_rows
-                 if r.get("review_status") != "unparsed"]
-        self.log(f"Would process {len(files)} file(s): {', '.join(files)}")
-        self.log(f"Signals: {', '.join(signals)}")
-        # TODO: call cd_data_processing graphing here
-
     def on_generate_plots(self):
         # Selection-driven: plot ONLY the currently selected staging-table
         # rows (Ctrl+A selects the whole filtered batch). Must stay on the
@@ -1433,7 +1466,6 @@ class MainWindow(QMainWindow):
             return
 
         self.generate_btn.setEnabled(False)
-        self.run_btn.setEnabled(False)
         self.generate_btn.setText("Generating...")
         self.log(f"Generating {len(signals)} plot(s) for {len(files)} file(s)...")
         QApplication.processEvents()
@@ -1458,7 +1490,6 @@ class MainWindow(QMainWindow):
         finally:
             self.generate_btn.setText("Plot Selected")
             self.generate_btn.setEnabled(True)
-            self.run_btn.setEnabled(True)
 
     def on_clear_signal(self, signal_label):
         """Clear one signal's Origin windows AND uncheck its checkbox.
