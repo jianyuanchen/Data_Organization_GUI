@@ -13,6 +13,7 @@ only way to change one is to re-promote the corrected local record.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Iterable
@@ -24,6 +25,57 @@ logger = logging.getLogger(__name__)
 # 5s is short enough that a bad URI fails before the GUI feels frozen, long
 # enough to forgive a single slow DNS hop or TLS handshake on Atlas.
 _SERVER_SELECTION_TIMEOUT_MS = 5000
+
+# Cross-machine identity. record_id is a per-machine UUID, so it CANNOT key
+# the cloud: the same experiment uploaded from two computers carries two
+# record_ids. Identity is instead (filename_key, data_hash) -- a normalized
+# filename plus a content hash of the spectral arrays -- which is identical on
+# any machine for the same measurement. See compute_data_hash / _filename_key.
+_HASH_DECIMALS = 6
+
+
+def _filename_key(csv_path: str) -> str:
+    """Normalized basename used to match the same file across machines.
+
+    Strips the directory (separator-agnostic, so a Windows backslash path and a
+    POSIX slash path collapse the same way), then strips surrounding whitespace
+    and lowercases. Two machines promoting the same experiment file produce the
+    same key regardless of where the file lives on disk.
+    """
+    raw = (csv_path or "").replace("\\", "/")
+    return raw.rsplit("/", 1)[-1].strip().lower()
+
+
+def _fmt_value(x) -> str:
+    """One spectral value as a fixed 6-dp string, with -0.0 collapsed to 0.0.
+
+    A fixed decimal width plus negative-zero normalization make the hash input
+    byte-identical for the same measurement on any machine -- tiny negatives
+    that round to zero (e.g. -1e-9) and a literal -0.0 both serialize as
+    "0.000000" so they never split into two cloud documents.
+    """
+    r = round(float(x), _HASH_DECIMALS)
+    if r == 0.0:                       # True for 0.0 and -0.0 alike
+        r = 0.0
+    return f"{r:.{_HASH_DECIMALS}f}"
+
+
+def compute_data_hash(wavelength, g, cd, uv) -> str:
+    """Stable SHA-256 over the SPECTRAL ARRAYS ONLY -- no metadata, no filename.
+
+    Each value is rounded to 6 dp on a throwaway serialization (the document
+    still stores the full-precision arrays unchanged) and emitted in a fixed
+    labeled order, so the same scan hashes identically across computers. 6 dp
+    is generous enough to tell genuinely different scans apart while tolerating
+    trivial floating-point / export noise that would otherwise look like a
+    different measurement and create a false conflict.
+    """
+    parts = []
+    for label, arr in (("wavelength", wavelength), ("g", g),
+                       ("cd", cd), ("uv", uv)):
+        parts.append(label + ":" + ",".join(_fmt_value(v) for v in (arr or [])))
+    blob = "|".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def get_client():
@@ -129,33 +181,55 @@ def _is_confirmed(rec: dict) -> bool:
 
 
 def promote_records(records: Iterable[dict], log=print) -> dict:
-    """Upsert each CONFIRMED local record into the configured Atlas collection.
+    """Insert each CONFIRMED local record into the Atlas collection, deduped.
 
     Records where review_status != 'confirmed' (or verified != 1) are skipped
     with a log line -- the caller may pass a raw selection that includes
     pending/rejected/needs_work/unparsed rows.
 
-    Documents are keyed on record_id via replace_one(upsert=True), so
-    re-promoting the same record updates the existing cloud doc instead of
-    duplicating. Each doc carries: all the record's metadata fields, the
-    embedded CSV spectra (wavelength + g + CD + UV as numeric lists), and
-    provenance (added_by, verified_date, promoted_at set to now).
+    Cross-machine dedup: identity is (filename_key, data_hash), NOT record_id
+    (a per-machine UUID). For each confirmed record we read its spectra, hash
+    them (compute_data_hash), normalize its filename (_filename_key), then look
+    the collection up and branch:
+
+      (a) filename_key AND data_hash both match an existing doc -> TRUE
+          DUPLICATE. Nothing is written (existing _id untouched); counted as
+          'already' and reported "Already in cloud, no change: <file>". This is
+          also what a machine re-promoting its own record hits.
+      (b) filename_key matches but data_hash differs -> CONFLICT. Nothing is
+          written; a conflict detail is recorded for the caller to surface as
+          an error dialog, and the upload is cancelled for that record.
+      (c) data_hash matches but filename_key differs -> CONFLICT (same data,
+          different name). Same cancel-and-report path as (b).
+      (d) neither matches -> NEW. insert_one assigns a fresh Mongo _id.
+
+    No path overwrites a differing document -- conflicts are cancelled, never
+    merged. record_id is still stored as a trace of the promoting machine, but
+    is no longer the identity key.
+
+    Each doc carries: all the record's metadata fields, the embedded CSV
+    spectra (wavelength + g + CD + UV as full-precision numeric lists),
+    data_hash + filename_key + filename, and provenance (record_id, added_by,
+    verified_date, promoted_at set to now).
 
     Returns a summary dict:
         {
-            "pushed":   int,              # newly inserted in Atlas
-            "updated":  int,              # existing doc replaced (matched)
-            "skipped":  int,              # not confirmed
-            "failed":   int,              # CSV read / upsert / connect error
-            "promoted": [(csv_path, promoted_at_iso), ...],
+            "pushed":    int,             # new docs inserted (case d)
+            "already":   int,             # true duplicates, unchanged (case a)
+            "conflicts": int,             # cancelled identity mismatches (b/c)
+            "skipped":   int,             # not confirmed
+            "failed":    int,             # CSV read / connect / insert error
+            "promoted":  [(csv_path, promoted_at_iso), ...],
+            "conflict_details": [(kind, filename, message), ...],
         }
-    The `promoted` list is what the caller should feed back into the local
-    DB (set promoted=1 + promoted_at) -- only rows that actually landed in
-    Atlas appear in it.
+    `promoted` is what the caller feeds back into the local DB (set promoted=1
+    + promoted_at) -- inserts AND true-duplicates appear there, since both mean
+    "this record is in the cloud". `conflict_details` (kind is 'name' or
+    'data') is what the caller pops as error dialogs.
     """
     summary: dict = {
-        "pushed": 0, "updated": 0, "skipped": 0, "failed": 0,
-        "promoted": [],
+        "pushed": 0, "already": 0, "conflicts": 0, "skipped": 0, "failed": 0,
+        "promoted": [], "conflict_details": [],
     }
 
     records = list(records)
@@ -178,7 +252,7 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         return summary
 
     # 3) Connect + ping up front so a bad URI fails ONCE here, not N times
-    #    inside the upsert loop several seconds apart.
+    #    inside the loop several seconds apart.
     client = None
     try:
         client = get_client()
@@ -193,6 +267,15 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             except Exception:
                 pass
         return summary
+
+    # 3b) Indexes backing the dedup lookups. Idempotent and non-unique (legacy
+    #     docs predate these fields, and identity is enforced in app logic, not
+    #     by a unique constraint). A failure here is non-fatal.
+    try:
+        collection.create_index("filename_key")
+        collection.create_index("data_hash")
+    except Exception as e:
+        log(f"  (cloud index note) {type(e).__name__}: {e}")
 
     # 4) Lazy import the CSV reader. plotting.py imports originpro at module
     #    top; we don't want this cloud module to need Origin just to read a
@@ -211,12 +294,14 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
     promoted_at = datetime.now(timezone.utc).isoformat()
 
     for rec in confirmed:
-        rid = rec.get("record_id")
         csv_path = rec.get("csv_path")
-        if not rid:
-            log(f"  skipping (no record_id): {csv_path}")
-            summary["failed"] += 1
-            continue
+        rid = rec.get("record_id")
+        # fkey (lowercased) is the match key; filename keeps the original case
+        # just for human-readable logs / dialog messages and the stored doc.
+        fkey = _filename_key(csv_path)
+        filename = ((csv_path or "").replace("\\", "/").rsplit("/", 1)[-1]
+                    or "(unknown)")
+
         try:
             cols = read_csv_columns(csv_path)
         except Exception as e:
@@ -229,32 +314,80 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             summary["failed"] += 1
             continue
 
-        doc = dict(rec)
-        doc["wavelength"] = list(cols[0])
-        doc["g"] = list(cols[1])
-        doc["cd"] = list(cols[2])
-        doc["uv"] = list(cols[3])
-        doc["promoted_at"] = promoted_at
-        # Stable key for upsert + future retrieval.
-        doc["record_id"] = rid
+        wavelength, g, cd, uv = cols[0], cols[1], cols[2], cols[3]
+        data_hash = compute_data_hash(wavelength, g, cd, uv)
 
+        # Dedup lookup: exact (a) first, then name-only (b), then hash-only (c).
         try:
-            result = collection.replace_one(
-                {"record_id": rid}, doc, upsert=True)
+            exact = collection.find_one(
+                {"filename_key": fkey, "data_hash": data_hash})
+            by_name = (None if exact is not None
+                       else collection.find_one({"filename_key": fkey}))
+            by_hash = (None if (exact is not None or by_name is not None)
+                       else collection.find_one({"data_hash": data_hash}))
         except Exception as e:
-            log(f"  upsert failed for {csv_path}: "
+            log(f"  dedup lookup failed for {csv_path}: "
                 f"{type(e).__name__}: {e}")
             summary["failed"] += 1
             continue
 
-        if result.upserted_id is not None:
-            summary["pushed"] += 1
-            log(f"  pushed: {csv_path}")
-        else:
-            # matched_count > 0 OR no-op replacement; either way the doc is
-            # in Atlas under this record_id.
-            summary["updated"] += 1
-            log(f"  updated: {csv_path}")
+        # (a) TRUE DUPLICATE -- same name AND same data already in cloud. Do not
+        #     rewrite (existing _id untouched); record it as already-present.
+        if exact is not None:
+            summary["already"] += 1
+            log(f"  Already in cloud, no change: {filename}")
+            summary["promoted"].append((csv_path, promoted_at))
+            continue
+
+        # (b) CONFLICT -- same filename, different data. Cancel, do not write.
+        if by_name is not None:
+            msg = ("Filename matches an existing cloud record but the data "
+                   "differs. Please double-check the filename -- same names "
+                   f"should have the same data. Upload cancelled for {filename}.")
+            log(f"  CONFLICT (name matches, data differs): {filename} "
+                f"-- upload cancelled.")
+            summary["conflicts"] += 1
+            summary["conflict_details"].append(("name", filename, msg))
+            continue
+
+        # (c) CONFLICT -- same data under a different filename. Cancel.
+        if by_hash is not None:
+            other = (by_hash.get("filename")
+                     or _filename_key(by_hash.get("csv_path", ""))
+                     or "(unknown)")
+            msg = ("This data already exists in the cloud under a different "
+                   f"filename ({other}). Possible duplicate/naming "
+                   f"inconsistency. Upload cancelled for {filename}.")
+            log(f"  CONFLICT (data matches '{other}', name differs): "
+                f"{filename} -- upload cancelled.")
+            summary["conflicts"] += 1
+            summary["conflict_details"].append(("data", filename, msg))
+            continue
+
+        # (d) NEW -- insert with a fresh Mongo _id. Full-precision arrays are
+        #     stored as-is; only the hash used a rounded throwaway copy.
+        doc = dict(rec)
+        doc.pop("_id", None)               # never carry in / regenerate an _id
+        doc["wavelength"] = list(wavelength)
+        doc["g"] = list(g)
+        doc["cd"] = list(cd)
+        doc["uv"] = list(uv)
+        doc["data_hash"] = data_hash
+        doc["filename_key"] = fkey
+        doc["filename"] = filename
+        doc["record_id"] = rid             # trace of promoting machine, NOT key
+        doc["promoted_at"] = promoted_at
+
+        try:
+            collection.insert_one(doc)
+        except Exception as e:
+            log(f"  insert failed for {csv_path}: "
+                f"{type(e).__name__}: {e}")
+            summary["failed"] += 1
+            continue
+
+        summary["pushed"] += 1
+        log(f"  pushed (new): {filename}")
         summary["promoted"].append((csv_path, promoted_at))
 
     try:

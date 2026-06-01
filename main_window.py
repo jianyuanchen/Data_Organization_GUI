@@ -991,8 +991,8 @@ class MainWindow(QMainWindow):
             f"(of {len(records)} total)...")
         QApplication.processEvents()
 
-        summary = {"pushed": 0, "updated": 0, "skipped": 0, "failed": 0,
-                   "promoted": []}
+        summary = {"pushed": 0, "already": 0, "conflicts": 0, "skipped": 0,
+                   "failed": 0, "promoted": [], "conflict_details": []}
         try:
             summary = promote_records(records, log=self.log)
         except Exception as e:
@@ -1007,8 +1007,9 @@ class MainWindow(QMainWindow):
             self.promote_batch_btn.setEnabled(True)
             self.promote_sel_btn.setEnabled(True)
 
-        # Mirror cloud upserts into the local DB. Done outside the try/except
-        # so a partial network failure still records what DID land.
+        # Mirror cloud inserts + already-present records into the local DB.
+        # Done outside the try/except so a partial network failure still
+        # records what DID land.
         for csv_path, promoted_at in summary["promoted"]:
             try:
                 self.db.mark_promoted(csv_path, promoted_at)
@@ -1017,16 +1018,27 @@ class MainWindow(QMainWindow):
                     f"  could not mark promoted locally for {csv_path}: "
                     f"{type(e).__name__}: {e}")
 
+        # Surface each cross-machine conflict as a modal error dialog. The
+        # write was already cancelled server-side -- nothing was overwritten.
+        # Main thread (we're in the GUI handler), so this is safe.
+        for _kind, _filename, message in summary.get("conflict_details", []):
+            QMessageBox.critical(self, "Cloud upload cancelled", message)
+
         self.log(
-            f"Promote summary: pushed {summary['pushed']}, "
-            f"updated {summary['updated']}, "
+            f"Promote summary: inserted {summary['pushed']}, "
+            f"already-present {summary['already']}, "
+            f"cancelled {summary['conflicts']} (conflicts), "
             f"skipped {summary['skipped']} (not confirmed), "
             f"failed {summary['failed']}.")
+        if summary.get("conflict_details"):
+            files = ", ".join(f for _, f, _ in summary["conflict_details"])
+            self.log(f"  cancelled (conflicts): {files}")
 
-        # Indicator: success if anything landed AND nothing failed; neutral
-        # if there was simply nothing eligible; failed otherwise.
-        landed = summary["pushed"] + summary["updated"]
-        if summary["failed"]:
+        # Indicator: errors if anything failed OR a conflict was cancelled;
+        # connected if anything landed (insert or already-present); neutral if
+        # there was simply nothing eligible.
+        landed = summary["pushed"] + summary["already"]
+        if summary["failed"] or summary["conflicts"]:
             self._set_cloud_status("failed", "Cloud: errors (see log)")
         elif landed > 0:
             self._set_cloud_status("connected", "Cloud: connected")
