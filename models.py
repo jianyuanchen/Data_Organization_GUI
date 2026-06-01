@@ -56,7 +56,7 @@ class Meta:
     anneal_temp: Optional[int]
     anneal_time: Optional[int]   # default tag, not from filename
     peak_g: float                # peak g-value, parsed from 'gval=' token
-    peak_wl: int                 # peak wavelength for the g-value peak (nm)
+    peak_wl: float               # peak wavelength for the g-value peak (nm)
     # Computed peaks from the verification window's Find Max/Min flow.
     # NOT filename-derived; default None and only filled in when the
     # reviewer applies a computed value. Apply sets edited=1, so the

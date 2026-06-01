@@ -45,8 +45,10 @@ def parse_filename(path: str) -> Meta:
     g_tok  = f.pop()           # e.g. "gval=0p047"
     if not wl_tok.endswith("nm"):
         raise ValueError(f"Bad wavelength token '{wl_tok}'")
+    # Accept integer ('500nm') and 'p'-decimal ('523p5nm' -> 523.5) forms,
+    # matching how speed (v0p005) and g-value (gval=0p47) encode decimals.
     try:
-        peak_wl = int(wl_tok[:-2])
+        peak_wl = float(wl_tok[:-2].replace("p", "."))
     except ValueError:
         raise ValueError(f"Bad wavelength token '{wl_tok}'")
     if not g_tok.startswith("gval="):
