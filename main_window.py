@@ -401,7 +401,7 @@ class MainWindow(QMainWindow):
         # Mueller Matrix is disabled and has no x button.
         v.addWidget(self.chk_mm)
 
-        self.generate_btn = QPushButton("Generate Plots")
+        self.generate_btn = QPushButton("Plot Selected")
         self.generate_btn.clicked.connect(self.on_generate_plots)
         v.addWidget(self.generate_btn)
         v.addStretch(1)
@@ -1379,25 +1379,33 @@ class MainWindow(QMainWindow):
         # TODO: call cd_data_processing graphing here
 
     def on_generate_plots(self):
-        # Same checkbox/row checks as on_run, but here we actually drive the
-        # graphing module. Must stay on the main thread -- originpro + COM
-        # is not reliably thread-safe.
+        # Selection-driven: plot ONLY the currently selected staging-table
+        # rows (Ctrl+A selects the whole filtered batch). Must stay on the
+        # main thread -- originpro + COM is not reliably thread-safe.
         signals = [name for chk, name in
                    [(self.chk_cd, "CD"), (self.chk_g, "G-value"),
                     (self.chk_uv, "UV-Vis")] if chk.isChecked()]
         if not signals:
             self.log("Select at least one plot type.")
             return
-        if not getattr(self, "current_rows", None):
-            self.log("No scans match the current filters.")
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            self.log("Select one or more rows first (Ctrl+A selects all).")
             return
+        # Sort by row index so the plot order mirrors what the user sees.
+        indices = sorted(idx.row() for idx in sel)
+        rows = [self.current_rows[r] for r in indices
+                if 0 <= r < len(self.current_rows)]
         # Unparsed rows have no parsed signals to plot -- exclude them.
         # build_plots reads the actual CSV columns by index, so handing it
         # an unparsed file would either silently emit nothing or raise.
-        files = [r["csv_path"] for r in self.current_rows
+        files = [r["csv_path"] for r in rows
                  if r.get("review_status") != "unparsed"]
+        skipped = len(rows) - len(files)
+        if skipped:
+            self.log(f"Skipping {skipped} unparsed/invalid selected row(s).")
         if not files:
-            self.log("No parseable scans in the current view to plot.")
+            self.log("No parseable scans in the selection to plot.")
             return
 
         # Lazy import so the GUI still launches when originpro isn't installed.
@@ -1448,7 +1456,7 @@ class MainWindow(QMainWindow):
                 f"Plot generation failed: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
         finally:
-            self.generate_btn.setText("Generate Plots")
+            self.generate_btn.setText("Plot Selected")
             self.generate_btn.setEnabled(True)
             self.run_btn.setEnabled(True)
 
