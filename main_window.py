@@ -1021,7 +1021,8 @@ class MainWindow(QMainWindow):
         # Surface each cross-machine conflict as a modal error dialog. The
         # write was already cancelled server-side -- nothing was overwritten.
         # Main thread (we're in the GUI handler), so this is safe.
-        for _kind, _filename, message in summary.get("conflict_details", []):
+        for _kind, _filename, _existing_id, message in summary.get(
+                "conflict_details", []):
             QMessageBox.critical(self, "Cloud upload cancelled", message)
 
         self.log(
@@ -1030,9 +1031,13 @@ class MainWindow(QMainWindow):
             f"cancelled {summary['conflicts']} (conflicts), "
             f"skipped {summary['skipped']} (not confirmed), "
             f"failed {summary['failed']}.")
-        if summary.get("conflict_details"):
-            files = ", ".join(f for _, f, _ in summary["conflict_details"])
-            self.log(f"  cancelled (conflicts): {files}")
+        # Permanent record of which cloud doc to check for each cancelled
+        # conflict: filename + the existing record's _id.
+        for _kind, filename, existing_id, _msg in summary.get(
+                "conflict_details", []):
+            self.log(
+                f"  cancelled (conflict): {filename} -- existing _id: "
+                f"{existing_id}")
 
         # Indicator: errors if anything failed OR a conflict was cancelled;
         # connected if anything landed (insert or already-present); neutral if

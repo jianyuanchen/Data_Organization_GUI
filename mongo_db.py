@@ -220,12 +220,13 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             "skipped":   int,             # not confirmed
             "failed":    int,             # CSV read / connect / insert error
             "promoted":  [(csv_path, promoted_at_iso), ...],
-            "conflict_details": [(kind, filename, message), ...],
+            "conflict_details": [(kind, filename, existing_id, message), ...],
         }
     `promoted` is what the caller feeds back into the local DB (set promoted=1
     + promoted_at) -- inserts AND true-duplicates appear there, since both mean
     "this record is in the cloud". `conflict_details` (kind is 'name' or
-    'data') is what the caller pops as error dialogs.
+    'data'; existing_id is the stringified _id of the conflicting cloud doc) is
+    what the caller pops as error dialogs.
     """
     summary: dict = {
         "pushed": 0, "already": 0, "conflicts": 0, "skipped": 0, "failed": 0,
@@ -340,28 +341,37 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             continue
 
         # (b) CONFLICT -- same filename, different data. Cancel, do not write.
+        #     Surface the existing doc's _id so the user can locate that exact
+        #     record in Atlas to inspect/delete when resolving manually.
         if by_name is not None:
+            existing_id = by_name.get("_id")
             msg = ("Filename matches an existing cloud record but the data "
-                   "differs. Please double-check the filename -- same names "
-                   f"should have the same data. Upload cancelled for {filename}.")
+                   f"differs. Existing record _id: {existing_id}. Please "
+                   "double-check the filename -- same names should have the "
+                   f"same data. Upload cancelled for {filename}.")
             log(f"  CONFLICT (name matches, data differs): {filename} "
-                f"-- upload cancelled.")
+                f"-- existing _id: {existing_id} -- upload cancelled.")
             summary["conflicts"] += 1
-            summary["conflict_details"].append(("name", filename, msg))
+            summary["conflict_details"].append(
+                ("name", filename, str(existing_id), msg))
             continue
 
-        # (c) CONFLICT -- same data under a different filename. Cancel.
+        # (c) CONFLICT -- same data under a different filename. Cancel. Include
+        #     the existing doc's _id alongside its filename for manual lookup.
         if by_hash is not None:
+            existing_id = by_hash.get("_id")
             other = (by_hash.get("filename")
                      or _filename_key(by_hash.get("csv_path", ""))
                      or "(unknown)")
             msg = ("This data already exists in the cloud under a different "
-                   f"filename ({other}). Possible duplicate/naming "
-                   f"inconsistency. Upload cancelled for {filename}.")
-            log(f"  CONFLICT (data matches '{other}', name differs): "
-                f"{filename} -- upload cancelled.")
+                   f"filename ({other}, _id: {existing_id}). Possible "
+                   f"duplicate/naming inconsistency. Upload cancelled for "
+                   f"{filename}.")
+            log(f"  CONFLICT (data matches '{other}', _id: {existing_id}, "
+                f"name differs): {filename} -- upload cancelled.")
             summary["conflicts"] += 1
-            summary["conflict_details"].append(("data", filename, msg))
+            summary["conflict_details"].append(
+                ("data", filename, str(existing_id), msg))
             continue
 
         # (d) NEW -- insert with a fresh Mongo _id. Full-precision arrays are
