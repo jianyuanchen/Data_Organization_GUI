@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QGroupBox, QSplitter, QMessageBox,
-    QSizePolicy,
+    QSizePolicy, QScrollArea,
 )
 
 import numpy as np
@@ -179,7 +179,9 @@ class CloudBrowserWindow(QDialog):
         root.addLayout(filt)
 
         # ---- Splitter: sidebar | metadata | plot ----
-        splitter = QSplitter()
+        # Horizontal so the user can drag the dividers to reallocate width
+        # between the records list, the metadata, and the plots.
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
         sidebar_box = QGroupBox("Cloud records")
         sidebar_v = QVBoxLayout(sidebar_box)
@@ -188,14 +190,24 @@ class CloudBrowserWindow(QDialog):
         # batch; a plain click still loads one record into the inline view.
         self.sidebar.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Small minimum so the list can be dragged narrow to give the plots
+        # more room; without this the list's wide sizeHint hogs the splitter.
+        self.sidebar.setMinimumWidth(150)
         self.sidebar.itemClicked.connect(self._on_sidebar_click)
         sidebar_v.addWidget(self.sidebar)
-        sidebar_v.addWidget(QLabel(
-            "Tip: Ctrl/Shift-click to select several records to plot in Origin."))
+        # Wrap the tip so its full-width text doesn't pin a large minimum width
+        # on the panel (which would stop the splitter from being dragged narrow).
+        tip = QLabel(
+            "Tip: Ctrl/Shift-click to select several records to plot in Origin.")
+        tip.setWordWrap(True)
+        sidebar_v.addWidget(tip)
         splitter.addWidget(sidebar_box)
 
         # ---- Metadata pane (read-only labels) ----
-        meta_box = QGroupBox("Record metadata (read-only)")
+        # Short title so its width doesn't pin a large panel minimum (the
+        # read-only nature is already stated in the banner above). This lets
+        # the user drag the metadata narrow to widen the plots.
+        meta_box = QGroupBox("Record metadata")
         meta_v = QVBoxLayout(meta_box)
         self.record_header = QLabel()
         self.record_header.setTextFormat(Qt.TextFormat.RichText)
@@ -213,12 +225,20 @@ class CloudBrowserWindow(QDialog):
             lab.setStyleSheet("color:#222;")
             self.field_labels[col] = lab
             form.addRow(QLabel(col + ":"), lab)
-        meta_v.addWidget(form_host)
-        meta_v.addStretch(1)
+        # Host the form in a scroll area so the metadata panel can be dragged
+        # narrow (to give the plots more room) without clipping -- a horizontal
+        # scrollbar appears only when it's squeezed below the form's width.
+        meta_scroll = QScrollArea()
+        meta_scroll.setWidgetResizable(True)
+        meta_scroll.setWidget(form_host)
+        meta_scroll.setMinimumWidth(140)
+        meta_v.addWidget(meta_scroll, stretch=1)
         splitter.addWidget(meta_box)
 
         # ---- Plot pane: 3 sharex'd subplots + range band + peak readout ----
-        plot_box = QGroupBox("Per-record plots (embedded arrays)")
+        # Short title (see metadata note) so the panel can be dragged narrow;
+        # the curves come from the records' embedded arrays.
+        plot_box = QGroupBox("Per-record plots")
         plot_v = QVBoxLayout(plot_box)
 
         range_row = QHBoxLayout()
@@ -270,9 +290,15 @@ class CloudBrowserWindow(QDialog):
 
         splitter.addWidget(plot_box)
 
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        # Default split: give the plots the largest share so the CD/g/UV curves
+        # open reasonably large, with a compact records list and metadata. The
+        # user can drag any divider to override. Stretch factors make the plots
+        # pane absorb the most width when the window is enlarged/maximized.
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 4)
+        splitter.setSizes([230, 300, 920])
+        splitter.setChildrenCollapsible(False)
         root.addWidget(splitter, stretch=1)
 
         # ---- Origin output row: signal checkboxes + Plot Selected button ----
