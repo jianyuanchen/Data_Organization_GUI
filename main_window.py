@@ -14,6 +14,8 @@ Filename convention (underscore-separated):
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import traceback
 import uuid
 from datetime import datetime
@@ -25,12 +27,35 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
-    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox,
+    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu,
 )
 
 from models import COLUMNS, REVIEW_STATUS_COLORS, VISIBLE_COLUMNS, canon_path
 from parser import parse_filename
 from database import DB
+
+
+def reveal_in_explorer(path: str) -> None:
+    """Reveal a file in the OS file browser, HIGHLIGHTED, without OPENING it.
+
+    Windows: ``explorer /select,<path>`` (explorer returns a nonzero exit code
+    even on success, so we never check it). macOS: ``open -R``. Linux:
+    ``xdg-open`` on the containing folder (no portable "highlight" verb).
+
+    On Windows the command is passed as one string (shell=False) so CreateProcess
+    receives exactly ``explorer /select,"<path>"`` -- the quotes cover spaces and,
+    because cmd.exe is not involved, characters like ``&`` / ``^`` in the name are
+    not special; valid Windows filenames cannot contain a double-quote, so this is
+    always safe. On macOS/Linux the path is a single argv element, so spaces and
+    special characters need no shell quoting either.
+    """
+    full = os.path.normpath(os.path.abspath(path))
+    if sys.platform.startswith("win"):
+        subprocess.run(f'explorer /select,"{full}"')
+    elif sys.platform == "darwin":
+        subprocess.run(["open", "-R", full])
+    else:
+        subprocess.run(["xdg-open", os.path.dirname(full)])
 
 
 def new_batch_id() -> str:
@@ -313,6 +338,12 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.itemChanged.connect(self.on_cell_edited)
+        # Right-click menu: reveal a row's CSV in the system file browser
+        # (reveal only -- never opens the file).
+        self.table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(
+            self._on_table_context_menu)
         # Expand vertically so dragging the splitter (or maximizing the
         # window) grows the visible row area instead of leaving empty space.
         # The table keeps its own scroll bar for rows beyond what fits.
@@ -1009,6 +1040,48 @@ class MainWindow(QMainWindow):
         self.log(f"Deleted {n} local record(s).")
         self.refresh_table()
         self.refresh_filter_options()
+
+    def _on_table_context_menu(self, pos):
+        """Right-click menu on a staging row: 'Show in Explorer' (reveal only).
+
+        Acts on the row UNDER the cursor (independent of the multi-row
+        selection used by promote/delete), so a single right-click reveals one
+        file. A click on empty space (row < 0) shows no menu.
+        """
+        index = self.table.indexAt(pos)
+        row = index.row()
+        if row < 0 or row >= len(getattr(self, "current_rows", [])):
+            return
+        menu = QMenu(self.table)
+        reveal_act = menu.addAction("Show in Explorer")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is reveal_act:
+            self._reveal_local_row(row)
+
+    def _reveal_local_row(self, row: int):
+        """Reveal a local staging row's CSV in the file browser, or explain
+        that the file is gone. Local rows are THIS machine's own files, so a
+        missing file just means it was moved/deleted locally (no other-uploader
+        concept here -- that's only relevant in the cloud browser).
+        """
+        csv_path = self.current_rows[row].get("csv_path")
+        name = os.path.basename(csv_path) if csv_path else "(unknown)"
+        try:
+            exists = bool(csv_path) and os.path.exists(csv_path)
+        except Exception:
+            exists = False
+        if not exists:
+            QMessageBox.information(
+                self, "File not found",
+                f"File not found on this machine: {name}. "
+                f"It may have been moved or deleted locally.")
+            self.log(f"File not found on this machine: {name}.")
+            return
+        try:
+            reveal_in_explorer(csv_path)
+            self.log(f"Revealed in Explorer: {name}")
+        except Exception as e:
+            self.log(f"Could not reveal {name}: {type(e).__name__}: {e}")
 
     def _run_promote(self, records, *, source: str):
         """Shared driver for both promote buttons. Blocks the promote buttons,

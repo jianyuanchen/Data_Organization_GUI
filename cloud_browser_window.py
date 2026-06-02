@@ -14,6 +14,9 @@ are deliberately out of scope here.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import traceback
 
 from PyQt6.QtCore import Qt
@@ -22,7 +25,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QGroupBox, QSplitter, QMessageBox,
-    QSizePolicy, QScrollArea,
+    QSizePolicy, QScrollArea, QMenu,
 )
 
 import numpy as np
@@ -30,6 +33,29 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from models import VISIBLE_COLUMNS
+
+
+def reveal_in_explorer(path: str) -> None:
+    """Reveal a file in the OS file browser, HIGHLIGHTED, without OPENING it.
+
+    Windows: ``explorer /select,<path>`` (explorer returns a nonzero exit code
+    even on success, so we never check it). macOS: ``open -R``. Linux:
+    ``xdg-open`` on the containing folder (no portable "highlight" verb).
+
+    On Windows the command is passed as one string (shell=False) so CreateProcess
+    receives exactly ``explorer /select,"<path>"`` -- the quotes cover spaces and,
+    because cmd.exe is not involved, characters like ``&`` / ``^`` in the name are
+    not special; valid Windows filenames cannot contain a double-quote, so this is
+    always safe. On macOS/Linux the path is a single argv element, so spaces and
+    special characters need no shell quoting either.
+    """
+    full = os.path.normpath(os.path.abspath(path))
+    if sys.platform.startswith("win"):
+        subprocess.run(f'explorer /select,"{full}"')
+    elif sys.platform == "darwin":
+        subprocess.run(["open", "-R", full])
+    else:
+        subprocess.run(["xdg-open", os.path.dirname(full)])
 
 
 # Key of each signal's embedded array in the cloud document (set by
@@ -194,6 +220,12 @@ class CloudBrowserWindow(QDialog):
         # more room; without this the list's wide sizeHint hogs the splitter.
         self.sidebar.setMinimumWidth(150)
         self.sidebar.itemClicked.connect(self._on_sidebar_click)
+        # Right-click menu: reveal a cloud record's CSV in the file browser if
+        # it happens to live on this machine (reveal only -- never opens it).
+        self.sidebar.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sidebar.customContextMenuRequested.connect(
+            self._on_sidebar_context_menu)
         sidebar_v.addWidget(self.sidebar)
         # Wrap the tip so its full-width text doesn't pin a large minimum width
         # on the panel (which would stop the splitter from being dragged narrow).
@@ -432,6 +464,60 @@ class CloudBrowserWindow(QDialog):
 
     def _on_sidebar_click(self, item: QListWidgetItem):
         self._load_record(self.sidebar.row(item))
+
+    def _on_sidebar_context_menu(self, pos):
+        """Right-click menu on a cloud record: 'Show in Explorer' (reveal only).
+
+        Acts on the record under the cursor. A click on empty space (no item)
+        shows no menu.
+        """
+        item = self.sidebar.itemAt(pos)
+        if item is None:
+            return
+        row = self.sidebar.row(item)
+        if not (0 <= row < len(self.records)):
+            return
+        menu = QMenu(self.sidebar)
+        reveal_act = menu.addAction("Show in Explorer")
+        chosen = menu.exec(self.sidebar.viewport().mapToGlobal(pos))
+        if chosen is reveal_act:
+            self._reveal_cloud_record(row)
+
+    def _reveal_cloud_record(self, row: int):
+        """Reveal a cloud record's CSV if it exists on THIS machine; otherwise
+        explain that the file lives on the uploader's computer.
+
+        Cloud records are frequently promoted from another machine, so the
+        stored csv_path usually won't resolve locally. We surface the uploader
+        from the record's provenance (added_by). NOTE: we store added_by (the
+        person) but NOT the machine name -- if machine-name tracking is wanted
+        later, it would need adding as a field at promotion time in
+        mongo_db.promote_records.
+        """
+        rec = self.records[row]
+        csv_path = rec.get("csv_path") or ""
+        name = os.path.basename(csv_path) if csv_path else "(unknown)"
+        try:
+            exists = bool(csv_path) and os.path.exists(csv_path)
+        except Exception:
+            exists = False
+        if exists:
+            try:
+                reveal_in_explorer(csv_path)
+                self._log(f"Revealed in Explorer: {name}")
+            except Exception as e:
+                self._log(f"Could not reveal {name}: {type(e).__name__}: {e}")
+            return
+        uploader = (rec.get("added_by") or "").strip() or "an unknown user"
+        QMessageBox.information(
+            self, "File not on this machine",
+            f"This file is not on your machine. It was uploaded by "
+            f"{uploader} and may exist only on their computer. "
+            f"(The spectral data is still available in the cloud record "
+            f"for plotting.)")
+        self._log(
+            f"Cloud file not on this machine: {name} "
+            f"(uploaded by {uploader}).")
 
     # ------------------------------------------------------- record load ----
     def _show_empty_state(self):
