@@ -371,6 +371,24 @@ class DB:
             tuple(canonical)).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_records(self, csv_paths) -> int:
+        """Delete rows by canonical csv_path. LOCAL ONLY -- never touches the
+        cloud, so anything already promoted to MongoDB stays safe in Atlas.
+
+        Canonicalizes every input path (like records_by_paths) so callers can
+        pass raw paths from the table. Returns the number of rows removed.
+        Empty input -> 0, with no SQL "IN ()" pitfall.
+        """
+        if not csv_paths:
+            return 0
+        canonical = [canon_path(p) for p in csv_paths]
+        placeholders = ",".join("?" for _ in canonical)
+        cur = self.conn.execute(
+            f"DELETE FROM scans WHERE csv_path IN ({placeholders})",
+            tuple(canonical))
+        self.conn.commit()
+        return cur.rowcount
+
     def batches_summary(self) -> list[tuple]:
         """Return (batch_id, folder_name, row_count) per batch, most-recent
         first. `folder_name` is the basename of the dirname of any row in

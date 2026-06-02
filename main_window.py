@@ -259,6 +259,16 @@ class MainWindow(QMainWindow):
         header.addWidget(self.toast)
         header.addStretch(1)
 
+        # Local-only delete: removes selected rows from the working SQLite DB.
+        # Deliberately worded "Local" so it's never confused with the cloud
+        # vault -- promoted records stay safe in MongoDB.
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.setToolTip(
+            "Delete the selected rows from the LOCAL database only. Does not "
+            "affect records already promoted to the cloud. Cannot be undone.")
+        self.delete_btn.clicked.connect(self.on_delete_selected)
+        header.addWidget(self.delete_btn)
+
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setToolTip(
             "Enter edit mode. Cells stage in memory; nothing reaches the "
@@ -956,6 +966,49 @@ class MainWindow(QMainWindow):
             self.log("Selected rows have no matching records in the DB.")
             return
         self._run_promote(records, source=f"selection ({len(records)})")
+
+    def on_delete_selected(self):
+        """Delete the currently-selected staging rows from the LOCAL DB only.
+
+        Confirmation-gated and irreversible locally, but never touches the
+        cloud: anything already promoted stays in MongoDB. After deleting we
+        refresh the table + filter options so the removed rows disappear.
+        """
+        if not self._guard_pending():
+            return
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            self.log("Select one or more rows to delete.")
+            return
+        indices = sorted(idx.row() for idx in sel)
+        paths = [self.current_rows[r]["csv_path"]
+                 for r in indices
+                 if 0 <= r < len(self.current_rows)]
+        if not paths:
+            self.log("Select one or more rows to delete.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Delete from LOCAL database?",
+            f"Delete {len(paths)} record(s) from the LOCAL database?\n\n"
+            f"This does not affect any records already promoted to the "
+            f"cloud. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            self.log("Delete cancelled.")
+            return
+
+        try:
+            n = self.db.delete_records(paths)
+        except Exception as e:
+            self.log(f"Delete failed: {type(e).__name__}: {e}")
+            return
+
+        self.log(f"Deleted {n} local record(s).")
+        self.refresh_table()
+        self.refresh_filter_options()
 
     def _run_promote(self, records, *, source: str):
         """Shared driver for both promote buttons. Blocks the promote buttons,

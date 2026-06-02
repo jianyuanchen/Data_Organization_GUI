@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -35,15 +37,39 @@ _HASH_DECIMALS = 6
 
 
 def _filename_key(csv_path: str) -> str:
-    """Normalized basename used to match the same file across machines.
+    """Path-INDEPENDENT identity key derived from the file's basename alone.
 
-    Strips the directory (separator-agnostic, so a Windows backslash path and a
-    POSIX slash path collapse the same way), then strips surrounding whitespace
-    and lowercases. Two machines promoting the same experiment file produce the
-    same key regardless of where the file lives on disk.
+    The folder a file lives in must never affect cloud dedup, so the SAME
+    experiment file in ANY directory on ANY machine has to collapse to one key:
+
+      1. os.path.basename -- drop every directory/path component (separator-
+         agnostic: backslashes are slashed first so Windows paths split too).
+      2. drop the file extension.
+      3. strip any leading "._" (macOS AppleDouble) / stray leading
+         punctuation / whitespace.
+      4. lowercase and strip surrounding whitespace.
+
+    e.g. r"C:\\\\runs\\\\F8BT_500nm.csv", "/data/F8BT_500nm.CSV", and
+    "._F8BT_500nm.csv" all yield "f8bt_500nm".
     """
     raw = (csv_path or "").replace("\\", "/")
-    return raw.rsplit("/", 1)[-1].strip().lower()
+    base = os.path.basename(raw)             # (1) drop folders
+    base = os.path.splitext(base)[0]         # (2) drop extension
+    base = re.sub(r"^[^0-9A-Za-z]+", "", base)  # (3) leading "._"/punct/space
+    return base.strip().lower()              # (4) casefold + trim
+
+
+def _doc_name_key(doc: dict) -> str:
+    """Normalize an EXISTING cloud doc's stored name with the same rule.
+
+    Legacy docs may carry a path-dependent or differently-normalized
+    filename_key (older builds kept the extension and the directory could leak
+    in). Re-deriving the key from the best available stored field at comparison
+    time means both sides use the current rule, so old records still match.
+    """
+    src = (doc.get("filename") or doc.get("csv_path")
+           or doc.get("filename_key") or "")
+    return _filename_key(src)
 
 
 def _fmt_value(x) -> str:
@@ -269,9 +295,9 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
                 pass
         return summary
 
-    # 3b) Indexes backing the dedup lookups. Idempotent and non-unique (legacy
-    #     docs predate these fields, and identity is enforced in app logic, not
-    #     by a unique constraint). A failure here is non-fatal.
+    # 3b) Index the identity fields for general query hygiene (fetch/back-office
+    #     filtering). Dedup itself matches in memory with normalization, so it
+    #     doesn't rely on these. Idempotent and non-unique; failure is non-fatal.
     try:
         collection.create_index("filename_key")
         collection.create_index("data_hash")
@@ -291,6 +317,35 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         except Exception:
             pass
         return summary
+
+    # 5) Build an in-memory dedup index from the existing docs, normalizing
+    #    each stored name with the CURRENT rule (_doc_name_key). Doing the
+    #    match in memory -- rather than querying filename_key server-side --
+    #    means legacy docs whose stored key was path-dependent or differently
+    #    normalized still match correctly, because both sides use today's rule.
+    #    Only light identifying fields are projected (no big spectra arrays).
+    #    New inserts append to this list so duplicates within one batch are
+    #    caught too.
+    try:
+        existing = list(collection.find(
+            {}, {"filename_key": 1, "filename": 1, "csv_path": 1,
+                 "data_hash": 1}))
+    except Exception as e:
+        log(f"Cloud read for dedup failed: {type(e).__name__}: {e}")
+        summary["failed"] += len(confirmed)
+        try:
+            client.close()
+        except Exception:
+            pass
+        return summary
+
+    dedup_index = [
+        {"key": _doc_name_key(d), "hash": d.get("data_hash"),
+         "_id": d.get("_id"),
+         "filename": (d.get("filename") or d.get("filename_key")
+                      or "(unknown)")}
+        for d in existing
+    ]
 
     promoted_at = datetime.now(timezone.utc).isoformat()
 
@@ -318,19 +373,17 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         wavelength, g, cd, uv = cols[0], cols[1], cols[2], cols[3]
         data_hash = compute_data_hash(wavelength, g, cd, uv)
 
-        # Dedup lookup: exact (a) first, then name-only (b), then hash-only (c).
-        try:
-            exact = collection.find_one(
-                {"filename_key": fkey, "data_hash": data_hash})
-            by_name = (None if exact is not None
-                       else collection.find_one({"filename_key": fkey}))
-            by_hash = (None if (exact is not None or by_name is not None)
-                       else collection.find_one({"data_hash": data_hash}))
-        except Exception as e:
-            log(f"  dedup lookup failed for {csv_path}: "
-                f"{type(e).__name__}: {e}")
-            summary["failed"] += 1
-            continue
+        # Path-independent dedup, matched in memory so both sides use today's
+        # normalization: exact (a) first, then name-only (b), then hash-only
+        # (c). fkey is already basename-only, so the same file in any folder
+        # collapses to the same key as the stored doc's normalized name.
+        exact = next((e for e in dedup_index
+                      if e["key"] == fkey and e["hash"] == data_hash), None)
+        by_name = (None if exact is not None else
+                   next((e for e in dedup_index if e["key"] == fkey), None))
+        by_hash = (None if (exact is not None or by_name is not None) else
+                   next((e for e in dedup_index if e["hash"] == data_hash),
+                        None))
 
         # (a) TRUE DUPLICATE -- same name AND same data already in cloud. Do not
         #     rewrite (existing _id untouched); record it as already-present.
@@ -360,9 +413,7 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         #     the existing doc's _id alongside its filename for manual lookup.
         if by_hash is not None:
             existing_id = by_hash.get("_id")
-            other = (by_hash.get("filename")
-                     or _filename_key(by_hash.get("csv_path", ""))
-                     or "(unknown)")
+            other = by_hash.get("filename") or "(unknown)"
             msg = ("This data already exists in the cloud under a different "
                    f"filename ({other}, _id: {existing_id}). Possible "
                    f"duplicate/naming inconsistency. Upload cancelled for "
@@ -389,13 +440,17 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         doc["promoted_at"] = promoted_at
 
         try:
-            collection.insert_one(doc)
+            result = collection.insert_one(doc)
         except Exception as e:
             log(f"  insert failed for {csv_path}: "
                 f"{type(e).__name__}: {e}")
             summary["failed"] += 1
             continue
 
+        # Keep the in-memory index current so a second copy of this file later
+        # in the SAME batch is detected as a true duplicate, not re-inserted.
+        dedup_index.append({"key": fkey, "hash": data_hash,
+                            "_id": result.inserted_id, "filename": filename})
         summary["pushed"] += 1
         log(f"  pushed (new): {filename}")
         summary["promoted"].append((csv_path, promoted_at))
