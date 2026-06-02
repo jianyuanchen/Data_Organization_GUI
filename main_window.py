@@ -1240,7 +1240,7 @@ class MainWindow(QMainWindow):
             f"(of {len(records)} total)...")
         QApplication.processEvents()
 
-        summary = {"pushed": 0, "already": 0, "conflicts": 0, "skipped": 0,
+        summary = {"pushed": 0, "already": 0, "conflicts": [], "skipped": 0,
                    "failed": 0, "promoted": [], "conflict_details": []}
         try:
             summary = promote_records(records, log=self.log)
@@ -1277,7 +1277,7 @@ class MainWindow(QMainWindow):
         self.log(
             f"Promote summary: inserted {summary['pushed']}, "
             f"already-present {summary['already']}, "
-            f"cancelled {summary['conflicts']} (conflicts), "
+            f"cancelled {len(summary['conflicts'])} (conflicts), "
             f"skipped {summary['skipped']} (not confirmed), "
             f"failed {summary['failed']}.")
         # Permanent record of which cloud doc to check for each cancelled

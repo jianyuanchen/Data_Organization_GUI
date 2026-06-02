@@ -59,19 +59,6 @@ def _filename_key(csv_path: str) -> str:
     return base.strip().lower()              # (4) casefold + trim
 
 
-def _doc_name_key(doc: dict) -> str:
-    """Normalize an EXISTING cloud doc's stored name with the same rule.
-
-    Legacy docs may carry a path-dependent or differently-normalized
-    filename_key (older builds kept the extension and the directory could leak
-    in). Re-deriving the key from the best available stored field at comparison
-    time means both sides use the current rule, so old records still match.
-    """
-    src = (doc.get("filename") or doc.get("csv_path")
-           or doc.get("filename_key") or "")
-    return _filename_key(src)
-
-
 def _fmt_value(x) -> str:
     """One spectral value as a fixed 6-dp string, with -0.0 collapsed to 0.0.
 
@@ -201,9 +188,41 @@ def _is_confirmed(rec: dict) -> bool:
 
     review_status='confirmed' alone (or verified=1 alone) means a partially-
     updated row -- treat it as not confirmed and skip with a log line.
+
+    `verified` is coerced via int(... or 0) == 1 rather than bool(...): a stray
+    string "0" (which is truthy under bool()) must NOT read as verified. Real
+    rows store an INTEGER 0/1, so this is exact for them and defensive for any
+    stringy value that slips in.
     """
     return (rec.get("review_status") == "confirmed"
-            and bool(rec.get("verified")))
+            and int(rec.get("verified") or 0) == 1)
+
+
+# Metadata fields NOT compared when describing a filename conflict to the
+# resolver: identity-derived fields, the bulk spectral arrays, and anything
+# that legitimately varies per machine / per upload (path, ids, bookkeeping,
+# workflow). What's left is the descriptive measurement metadata a human would
+# actually want to reconcile (solvent, ratio, conc, peaks, ...).
+_NON_COMPARABLE = {
+    "_id",
+    "wavelength", "g", "cd", "uv",            # bulk spectral arrays
+    "data_hash", "filename", "filename_key",  # identity / derived
+    "csv_path", "record_id", "batch_id",      # per-machine
+    "promoted", "promoted_at", "edited",      # local bookkeeping
+    "added_by", "verified", "verified_date",  # provenance / workflow
+    "review_status", "parse_error", "flags",  # workflow / diagnostics
+}
+
+
+def _diff_fields(rec: dict, doc: dict) -> list:
+    """Sorted names of metadata fields that differ between a local record and an
+    existing cloud doc, ignoring the _NON_COMPARABLE bookkeeping/identity set.
+
+    Only enriches a conflict descriptor so an in-app resolver can show 'these
+    fields disagree' -- it never gates a write.
+    """
+    keys = (set(rec.keys()) | set(doc.keys())) - _NON_COMPARABLE
+    return sorted(k for k in keys if rec.get(k) != doc.get(k))
 
 
 def promote_records(records: Iterable[dict], log=print) -> dict:
@@ -213,50 +232,66 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
     with a log line -- the caller may pass a raw selection that includes
     pending/rejected/needs_work/unparsed rows.
 
-    Cross-machine dedup: identity is (filename_key, data_hash), NOT record_id
-    (a per-machine UUID). For each confirmed record we read its spectra, hash
-    them (compute_data_hash), normalize its filename (_filename_key), then look
-    the collection up and branch:
+    Identity is the normalized FILENAME ALONE (filename_key). data_hash is still
+    computed and stored, but is now ADVISORY -- NOT part of identity. The lab
+    uses a strict filename convention, so the filename is the trustworthy key.
+    For each confirmed record we read its spectra, hash them (compute_data_hash),
+    normalize its filename (_filename_key), look the collection up BY
+    filename_key (a targeted, indexed query -- no full-collection scan), then
+    branch:
 
-      (a) filename_key AND data_hash both match an existing doc -> TRUE
+      (a) a doc with this filename_key exists AND its data_hash matches -> TRUE
           DUPLICATE. Nothing is written (existing _id untouched); counted as
           'already' and reported "Already in cloud, no change: <file>". This is
           also what a machine re-promoting its own record hits.
-      (b) filename_key matches but data_hash differs -> CONFLICT. Nothing is
-          written; a conflict detail is recorded for the caller to surface as
-          an error dialog, and the upload is cancelled for that record.
-      (c) data_hash matches but filename_key differs -> CONFLICT (same data,
-          different name). Same cancel-and-report path as (b).
-      (d) neither matches -> NEW. insert_one assigns a fresh Mongo _id.
+      (b) a doc with this filename_key exists but its data_hash DIFFERS ->
+          CONFLICT. Nothing is written; a rich conflict descriptor is collected
+          and returned for an in-app resolver. Reject, never overwrite.
+      (c) no doc with this filename_key -> NEW: insert_one assigns a fresh _id.
+          If the identical data_hash already exists under a DIFFERENT filename,
+          that is a different identity, so it is only LOGGED as an advisory and
+          does NOT block the insert.
+
+    Concurrency: a UNIQUE index on filename_key is the authority. If a parallel
+    promote inserts the same filename_key between our lookup and our insert, the
+    insert raises DuplicateKeyError; we re-read the now-existing doc and route it
+    back through (a)/(b) rather than counting a generic failure.
 
     No path overwrites a differing document -- conflicts are cancelled, never
-    merged. record_id is still stored as a trace of the promoting machine, but
-    is no longer the identity key.
+    merged. record_id is stored as a trace of the promoting machine, not a key.
 
-    Each doc carries: all the record's metadata fields, the embedded CSV
-    spectra (wavelength + g + CD + UV as full-precision numeric lists),
+    Each inserted doc carries: all the record's metadata fields, the embedded
+    CSV spectra (wavelength + g + CD + UV as full-precision numeric lists),
     data_hash + filename_key + filename, and provenance (record_id, added_by,
     verified_date, promoted_at set to now).
 
     Returns a summary dict:
         {
-            "pushed":    int,             # new docs inserted (case d)
+            "pushed":    int,             # new docs inserted (case c)
             "already":   int,             # true duplicates, unchanged (case a)
-            "conflicts": int,             # cancelled identity mismatches (b/c)
             "skipped":   int,             # not confirmed
             "failed":    int,             # CSV read / connect / insert error
             "promoted":  [(csv_path, promoted_at_iso), ...],
+            "conflicts": [ {              # case b -- for an in-app resolver
+                "record":           dict,   # the local record as passed in
+                "existing_id":      str,    # stringified _id of the cloud doc
+                "filename_key":     str,
+                "filename":         str,
+                "differing_fields": [str],  # metadata fields that disagree
+                "data_differs":     bool,   # spectral data/hash differs
+            }, ... ],
+            # Legacy mirror of `conflicts`, kept so the current main_window
+            # (which still reads conflict_details) keeps surfacing conflict
+            # dialogs until it migrates to the richer `conflicts` list.
             "conflict_details": [(kind, filename, existing_id, message), ...],
         }
     `promoted` is what the caller feeds back into the local DB (set promoted=1
     + promoted_at) -- inserts AND true-duplicates appear there, since both mean
-    "this record is in the cloud". `conflict_details` (kind is 'name' or
-    'data'; existing_id is the stringified _id of the conflicting cloud doc) is
-    what the caller pops as error dialogs.
+    "this record is in the cloud".
     """
     summary: dict = {
-        "pushed": 0, "already": 0, "conflicts": 0, "skipped": 0, "failed": 0,
-        "promoted": [], "conflict_details": [],
+        "pushed": 0, "already": 0, "skipped": 0, "failed": 0,
+        "promoted": [], "conflicts": [], "conflict_details": [],
     }
 
     records = list(records)
@@ -264,7 +299,9 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         log("No records to promote.")
         return summary
 
-    # 1) Eligibility filter. Non-confirmed rows never reach the network.
+    # 1) Eligibility filter. Non-confirmed rows never reach the network -- this
+    #    runs BEFORE get_client() below, so if nothing is confirmed we return
+    #    here without ever opening a connection.
     confirmed = [r for r in records if _is_confirmed(r)]
     summary["skipped"] = len(records) - len(confirmed)
     if summary["skipped"]:
@@ -295,14 +332,29 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
                 pass
         return summary
 
-    # 3b) Index the identity fields for general query hygiene (fetch/back-office
-    #     filtering). Dedup itself matches in memory with normalization, so it
-    #     doesn't rely on these. Idempotent and non-unique; failure is non-fatal.
+    # 3a) DuplicateKeyError is the authority behind the unique filename_key index
+    #     (see the insert path). pymongo imported fine above (get_client used
+    #     it), so this import is safe; guarded anyway so an unexpected failure
+    #     degrades to "no concurrent-insert recovery" rather than crashing.
     try:
-        collection.create_index("filename_key")
+        from pymongo.errors import DuplicateKeyError
+    except Exception:
+        DuplicateKeyError = None
+
+    # 3b) Indexes. Identity is filename_key ALONE, so make THAT unique -- the DB
+    #     then enforces one doc per filename even under concurrent promotes.
+    #     data_hash stays a PLAIN (non-unique) index for the advisory/back-office
+    #     lookups only. Idempotent; a failure here is non-fatal because the
+    #     application-level check below still runs.
+    try:
+        collection.create_index("filename_key", unique=True)
+    except Exception as e:
+        log(f"  (cloud index note) filename_key unique: "
+            f"{type(e).__name__}: {e}")
+    try:
         collection.create_index("data_hash")
     except Exception as e:
-        log(f"  (cloud index note) {type(e).__name__}: {e}")
+        log(f"  (cloud index note) data_hash: {type(e).__name__}: {e}")
 
     # 4) Lazy import the CSV reader. plotting.py imports originpro at module
     #    top; we don't want this cloud module to need Origin just to read a
@@ -318,42 +370,51 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             pass
         return summary
 
-    # 5) Build an in-memory dedup index from the existing docs, normalizing
-    #    each stored name with the CURRENT rule (_doc_name_key). Doing the
-    #    match in memory -- rather than querying filename_key server-side --
-    #    means legacy docs whose stored key was path-dependent or differently
-    #    normalized still match correctly, because both sides use today's rule.
-    #    Only light identifying fields are projected (no big spectra arrays).
-    #    New inserts append to this list so duplicates within one batch are
-    #    caught too.
-    try:
-        existing = list(collection.find(
-            {}, {"filename_key": 1, "filename": 1, "csv_path": 1,
-                 "data_hash": 1}))
-    except Exception as e:
-        log(f"Cloud read for dedup failed: {type(e).__name__}: {e}")
-        summary["failed"] += len(confirmed)
-        try:
-            client.close()
-        except Exception:
-            pass
-        return summary
-
-    dedup_index = [
-        {"key": _doc_name_key(d), "hash": d.get("data_hash"),
-         "_id": d.get("_id"),
-         "filename": (d.get("filename") or d.get("filename_key")
-                      or "(unknown)")}
-        for d in existing
-    ]
-
     promoted_at = datetime.now(timezone.utc).isoformat()
+
+    # Metadata-only projection: never pull the ~800-point spectra arrays back
+    # just to dedupe. Used for the filename_key lookup AND the advisory
+    # data_hash lookup (pure exclusion is legal and keeps _id + metadata).
+    _META_ONLY = {"wavelength": 0, "g": 0, "cd": 0, "uv": 0}
+
+    def _find_by_fkey(fkey):
+        """Existing doc for this filename_key (metadata only), or None."""
+        return collection.find_one({"filename_key": fkey}, _META_ONLY)
+
+    def _note_duplicate(csv_path, filename, *, concurrent=False):
+        summary["already"] += 1
+        suffix = " (concurrent insert)" if concurrent else ""
+        log(f"  Already in cloud, no change{suffix}: {filename}")
+        summary["promoted"].append((csv_path, promoted_at))
+
+    def _record_conflict(rec, existing, fkey, filename, data_hash,
+                         *, concurrent=False):
+        """Collect a rich conflict descriptor (+ a legacy detail tuple) and log.
+        Never writes -- the differing cloud doc is left exactly as-is."""
+        existing_id = existing.get("_id")
+        summary["conflicts"].append({
+            "record": rec,
+            "existing_id": str(existing_id),
+            "filename_key": fkey,
+            "filename": filename,
+            "differing_fields": _diff_fields(rec, existing),
+            "data_differs": existing.get("data_hash") != data_hash,
+        })
+        msg = ("Filename matches an existing cloud record but the data "
+               f"differs. Existing record _id: {existing_id}. Please "
+               "double-check the filename -- same names should have the "
+               f"same data. Upload cancelled for {filename}.")
+        summary["conflict_details"].append(
+            ("name", filename, str(existing_id), msg))
+        what = " (concurrent insert)" if concurrent else ""
+        log(f"  CONFLICT{what} (filename matches, data differs): {filename} "
+            f"-- existing _id: {existing_id} -- upload cancelled.")
 
     for rec in confirmed:
         csv_path = rec.get("csv_path")
         rid = rec.get("record_id")
-        # fkey (lowercased) is the match key; filename keeps the original case
-        # just for human-readable logs / dialog messages and the stored doc.
+        # fkey (lowercased) is the identity key; filename keeps the original
+        # case just for human-readable logs / messages and the stored doc.
         fkey = _filename_key(csv_path)
         filename = ((csv_path or "").replace("\\", "/").rsplit("/", 1)[-1]
                     or "(unknown)")
@@ -373,60 +434,40 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         wavelength, g, cd, uv = cols[0], cols[1], cols[2], cols[3]
         data_hash = compute_data_hash(wavelength, g, cd, uv)
 
-        # Path-independent dedup, matched in memory so both sides use today's
-        # normalization: exact (a) first, then name-only (b), then hash-only
-        # (c). fkey is already basename-only, so the same file in any folder
-        # collapses to the same key as the stored doc's normalized name.
-        exact = next((e for e in dedup_index
-                      if e["key"] == fkey and e["hash"] == data_hash), None)
-        by_name = (None if exact is not None else
-                   next((e for e in dedup_index if e["key"] == fkey), None))
-        by_hash = (None if (exact is not None or by_name is not None) else
-                   next((e for e in dedup_index if e["hash"] == data_hash),
-                        None))
-
-        # (a) TRUE DUPLICATE -- same name AND same data already in cloud. Do not
-        #     rewrite (existing _id untouched); record it as already-present.
-        if exact is not None:
-            summary["already"] += 1
-            log(f"  Already in cloud, no change: {filename}")
-            summary["promoted"].append((csv_path, promoted_at))
+        # --- Dedup by filename_key ALONE, via a targeted indexed lookup ------
+        try:
+            existing = _find_by_fkey(fkey)
+        except Exception as e:
+            log(f"  cloud lookup failed for {filename}: "
+                f"{type(e).__name__}: {e}")
+            summary["failed"] += 1
             continue
 
-        # (b) CONFLICT -- same filename, different data. Cancel, do not write.
-        #     Surface the existing doc's _id so the user can locate that exact
-        #     record in Atlas to inspect/delete when resolving manually.
-        if by_name is not None:
-            existing_id = by_name.get("_id")
-            msg = ("Filename matches an existing cloud record but the data "
-                   f"differs. Existing record _id: {existing_id}. Please "
-                   "double-check the filename -- same names should have the "
-                   f"same data. Upload cancelled for {filename}.")
-            log(f"  CONFLICT (name matches, data differs): {filename} "
-                f"-- existing _id: {existing_id} -- upload cancelled.")
-            summary["conflicts"] += 1
-            summary["conflict_details"].append(
-                ("name", filename, str(existing_id), msg))
+        if existing is not None:
+            if existing.get("data_hash") == data_hash:
+                # (a) TRUE DUPLICATE -- same filename, same data.
+                _note_duplicate(csv_path, filename)
+            else:
+                # (b) CONFLICT -- same filename, different data. Reject.
+                _record_conflict(rec, existing, fkey, filename, data_hash)
             continue
 
-        # (c) CONFLICT -- same data under a different filename. Cancel. Include
-        #     the existing doc's _id alongside its filename for manual lookup.
-        if by_hash is not None:
-            existing_id = by_hash.get("_id")
-            other = by_hash.get("filename") or "(unknown)"
-            msg = ("This data already exists in the cloud under a different "
-                   f"filename ({other}, _id: {existing_id}). Possible "
-                   f"duplicate/naming inconsistency. Upload cancelled for "
-                   f"{filename}.")
-            log(f"  CONFLICT (data matches '{other}', _id: {existing_id}, "
-                f"name differs): {filename} -- upload cancelled.")
-            summary["conflicts"] += 1
-            summary["conflict_details"].append(
-                ("data", filename, str(existing_id), msg))
-            continue
+        # (c) NEW. Advisory only: is this exact data already present under a
+        #     DIFFERENT filename? Different filename == different identity, so
+        #     we do NOT block -- just leave a breadcrumb. Best-effort: a failed
+        #     advisory lookup must not stop the insert. (We already know no doc
+        #     has this filename_key, so any data_hash hit is a different name.)
+        try:
+            other = collection.find_one({"data_hash": data_hash}, _META_ONLY)
+        except Exception:
+            other = None
+        if other is not None:
+            other_name = (other.get("filename") or other.get("filename_key")
+                          or "(unknown)")
+            log(f"  note: identical spectral data already present under "
+                f"filename {other_name} (_id {other.get('_id')}) -- "
+                f"inserting {filename} as new (different filename).")
 
-        # (d) NEW -- insert with a fresh Mongo _id. Full-precision arrays are
-        #     stored as-is; only the hash used a rounded throwaway copy.
         doc = dict(rec)
         doc.pop("_id", None)               # never carry in / regenerate an _id
         doc["wavelength"] = list(wavelength)
@@ -440,17 +481,38 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         doc["promoted_at"] = promoted_at
 
         try:
-            result = collection.insert_one(doc)
+            collection.insert_one(doc)
         except Exception as e:
-            log(f"  insert failed for {csv_path}: "
-                f"{type(e).__name__}: {e}")
-            summary["failed"] += 1
+            # A unique-index violation means a concurrent promote inserted this
+            # filename_key first. Re-read it and route through (a)/(b) -- that
+            # is NOT a generic failure. Any other error is a real failure.
+            is_dup = (DuplicateKeyError is not None
+                      and isinstance(e, DuplicateKeyError))
+            if not is_dup:
+                log(f"  insert failed for {csv_path}: "
+                    f"{type(e).__name__}: {e}")
+                summary["failed"] += 1
+                continue
+            try:
+                raced = _find_by_fkey(fkey)
+            except Exception as e2:
+                log(f"  insert raced then re-read failed for {filename}: "
+                    f"{type(e2).__name__}: {e2}")
+                summary["failed"] += 1
+                continue
+            if raced is None:
+                # Inserted-then-removed in the gap; redo it next time.
+                log(f"  insert raced for {filename} but no doc on re-read "
+                    f"-- counted failed.")
+                summary["failed"] += 1
+                continue
+            if raced.get("data_hash") == data_hash:
+                _note_duplicate(csv_path, filename, concurrent=True)
+            else:
+                _record_conflict(rec, raced, fkey, filename, data_hash,
+                                 concurrent=True)
             continue
 
-        # Keep the in-memory index current so a second copy of this file later
-        # in the SAME batch is detected as a true duplicate, not re-inserted.
-        dedup_index.append({"key": fkey, "hash": data_hash,
-                            "_id": result.inserted_id, "filename": filename})
         summary["pushed"] += 1
         log(f"  pushed (new): {filename}")
         summary["promoted"].append((csv_path, promoted_at))
