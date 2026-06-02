@@ -63,7 +63,7 @@ as-printed:  R3_F8BT_None_100_20Tol_v0p005_AP_gval=0p042_493nm
 
 | Field | Meaning | Notes |
 |---|---|---|
-| Series | Experiment id (R1, R2…) | |
+| Series | Experiment id (S1, S2…) | |
 | Poly1 | First polymer | C-PFBT with chiral side-chain %: `C-PFBT100`, `C-PFBT50` |
 | Poly2 | Second polymer, or `None` | `F8BT` (achiral) / `R-F8BT` / `S-F8BT` (main-chain chiral) |
 | Ratio | Solution mass ratio | `50x50`, or `100` for single-component |
