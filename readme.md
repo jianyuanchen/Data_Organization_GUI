@@ -57,13 +57,13 @@ All metadata is encoded in the CSV filename, underscore-separated. Hyphens appea
 ```
 Series _ Poly1 _ Poly2 _ Ratio _ ConcSolvent _ Speed _ State [_ Temp if AN] _ Gval _ Wavelength
 
-annealed:    R1_C-PFBT100_S-F8BT_50x50_20CB_v0p005_AN_T160_gval=0p047_500nm
-as-printed:  R3_F8BT_None_100_20Tol_v0p005_AP_gval=0p042_493nm
+annealed:    S1_C-PFBT100_S-F8BT_50x50_20CB_v0p005_AN_T160_gval=0p047_500nm
+as-printed:  S3_F8BT_None_100_20Tol_v0p005_AP_gval=0p042_493nm
 ```
 
 | Field | Meaning | Notes |
 |---|---|---|
-| Series | Experiment id (R1, R2…) | |
+| Series | Experiment id (S1, S2…) | |
 | Poly1 | First polymer | C-PFBT with chiral side-chain %: `C-PFBT100`, `C-PFBT50` |
 | Poly2 | Second polymer, or `None` | `F8BT` (achiral) / `R-F8BT` / `S-F8BT` (main-chain chiral) |
 | Ratio | Solution mass ratio | `50x50`, or `100` for single-component |
