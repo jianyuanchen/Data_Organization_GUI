@@ -92,6 +92,19 @@ class MainWindow(QMainWindow):
         # Single read-only CloudBrowserWindow instance, same lifecycle as the
         # verification window (kept alive non-modally; re-clicks raise it).
         self._cloud_browser_win = None
+        # Origin launch ownership: True ONLY when THIS app spawned the Origin
+        # process (the launch branch of Connect). Stays False when we merely
+        # attach to an Origin that was already running. Drives Close Origin's
+        # confirmation severity and is reset once we successfully close (or
+        # detect Origin is gone). See _connect_origin / on_close_origin.
+        self._origin_launched_by_us = False
+        # Last Origin indicator state ("connected"/"neutral"/"failed"), kept so
+        # _sync_close_origin_enabled can gate the Close Origin button without
+        # re-reading the label. Updated by _set_origin_status.
+        self._origin_state = "neutral"
+        # True while a plot build is running -- disables Close Origin so Origin
+        # can't be killed mid-plot (mirrors generate_btn disabling).
+        self._origin_busy = False
         # Cached QBrushes keyed by review_status -- one allocation per status,
         # reused across every refresh_table call. Empty hex -> empty QBrush
         # (default background), which is the "pending" row's natural look in
@@ -209,6 +222,16 @@ class MainWindow(QMainWindow):
         self._set_origin_status("neutral", "Origin: not connected")
         connect = QPushButton("Connect to Origin")
         connect.clicked.connect(self.on_connect_origin)
+        # Close Origin: releases Origin so it needn't stay open all session.
+        # Disabled until we're connected+verified (see _sync_close_origin_enabled),
+        # and while a plot build is running, so Origin can't be killed mid-plot.
+        self.close_origin_btn = QPushButton("Close Origin")
+        self.close_origin_btn.setToolTip(
+            "Close the connected OriginPro. If this app launched Origin it "
+            "closes directly (after a quick confirm); if Origin was already "
+            "running when we connected, you'll be asked to confirm first.")
+        self.close_origin_btn.clicked.connect(self.on_close_origin)
+        self.close_origin_btn.setEnabled(False)
         # Cloud connection indicator. Same three-state pattern as Origin:
         # connected (green) / neutral (gray, idle or unconfigured) / failed
         # (red). Kicked into shape after construction by startup_cloud_check.
@@ -235,6 +258,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.promote_sel_btn)
         h.addSpacing(20)
         h.addWidget(connect)
+        h.addWidget(self.close_origin_btn)
         h.addWidget(self.origin_status)
         h.addSpacing(10)
         h.addWidget(test_cloud)
@@ -775,6 +799,24 @@ class MainWindow(QMainWindow):
         self.origin_status.setText(f"  {text}  ")
         self.origin_status.setStyleSheet(
             f"background:{color};color:white;border-radius:4px;")
+        self._origin_state = state
+        # Close Origin is only meaningful while connected+verified; if we drop
+        # to neutral/failed, Origin is no longer ours to close, so forget any
+        # launch ownership too.
+        if state != "connected":
+            self._origin_launched_by_us = False
+        self._sync_close_origin_enabled()
+
+    def _sync_close_origin_enabled(self):
+        """Enable Close Origin only when connected+verified and not mid-build.
+
+        Mirrors how the other action buttons gate on state; called whenever the
+        Origin indicator changes or a build starts/finishes. Safe to call before
+        the button exists (during top-bar construction)."""
+        btn = getattr(self, "close_origin_btn", None)
+        if btn is None:
+            return
+        btn.setEnabled(self._origin_state == "connected" and not self._origin_busy)
 
     def _set_cloud_status(self, state: str, text: str):
         """Same three-state indicator pattern as Origin -- different label."""
@@ -881,7 +923,14 @@ class MainWindow(QMainWindow):
                 bits.append(f"at {exe_path}")
             if verbose:
                 self.log(" ".join(bits) + ".")
+            # Launch ownership: we only spawned Origin when nothing was running
+            # and we were asked to launch. Attaching to an already-running
+            # instance (startup probe or the attach branch) leaves this False so
+            # Close Origin warns harder before killing someone else's session.
+            # NB: must follow _set_origin_status, which clears the flag on any
+            # non-connected transition.
             self._set_origin_status("connected", "Origin: connected")
+            self._origin_launched_by_us = not running
         except Exception as e:
             self._set_origin_status("failed", "Origin: connection failed")
             if verbose:
@@ -890,6 +939,72 @@ class MainWindow(QMainWindow):
     def on_connect_origin(self):
         """User clicked Connect: attach if running, otherwise launch Origin."""
         self._connect_origin(launch=True)
+
+    def on_close_origin(self):
+        """Close the connected OriginPro, freeing it for the rest of the session.
+
+        Branches on launch ownership (self._origin_launched_by_us):
+          - WE launched it  -> a light confirm (unsaved Origin work is lost),
+                               then close.
+          - It was ALREADY running when we attached -> a sterner warning that
+                               this instance may be in use elsewhere, defaulting
+                               to Cancel; only close on explicit confirm.
+
+        The whole close is wrapped so a COM/originpro failure logs and never
+        crashes the GUI. originpro stays lazy-imported (GUI must launch on
+        machines without Origin). On success: gray indicator, ownership reset.
+        On failure: red indicator + logged error.
+        """
+        # Lazy import so the GUI still launches without originpro installed.
+        try:
+            import originpro as op
+        except ImportError as e:
+            self.log(f"originpro is not installed: {e}")
+            return
+
+        # Confirmation: severity depends on who owns the Origin process.
+        if self._origin_launched_by_us:
+            confirm = QMessageBox.question(
+                self,
+                "Close Origin?",
+                "This app launched OriginPro. Closing it now will discard any "
+                "unsaved Origin work.\n\nClose Origin?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+        else:
+            confirm = QMessageBox.question(
+                self,
+                "Close Origin that was already running?",
+                "This OriginPro instance was already open BEFORE this app "
+                "connected to it -- it may be in use for other work, and any "
+                "unsaved changes there will be lost.\n\nClose it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            self.log("Close Origin cancelled.")
+            return
+
+        # Close. Prefer originpro's own exit; fall back to the COM
+        # Application.Exit(). Wrapped so any COM failure is logged, not fatal.
+        try:
+            closed_via = None
+            if hasattr(op, "exit"):
+                op.exit()
+                closed_via = "originpro.exit()"
+            else:
+                app = op.po if getattr(op, "po", None) is not None else None
+                if app is None:
+                    raise RuntimeError(
+                        "no originpro exit() and no COM Application handle")
+                app.Exit()
+                closed_via = "COM Application.Exit()"
+            self._set_origin_status("neutral", "Origin: not connected")
+            self._origin_launched_by_us = False
+            self.log(f"Closed OriginPro via {closed_via}.")
+        except Exception as e:
+            self._set_origin_status("failed", "Origin: close failed")
+            self.log(f"Could not close Origin: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
 
     # ----- cloud (MongoDB Atlas) ------------------------------------------
     def on_test_cloud(self):
@@ -1610,6 +1725,10 @@ class MainWindow(QMainWindow):
 
         self.generate_btn.setEnabled(False)
         self.generate_btn.setText("Generating...")
+        # Lock out Close Origin for the duration so Origin can't be killed
+        # mid-plot (same intent as disabling Generate while it runs).
+        self._origin_busy = True
+        self._sync_close_origin_enabled()
         self.log(f"Generating {len(signals)} plot(s) for {len(files)} file(s)...")
         QApplication.processEvents()
         try:
@@ -1633,6 +1752,8 @@ class MainWindow(QMainWindow):
         finally:
             self.generate_btn.setText("Plot Selected")
             self.generate_btn.setEnabled(True)
+            self._origin_busy = False
+            self._sync_close_origin_enabled()
 
     def on_clear_signal(self, signal_label):
         """Clear one signal's Origin windows AND uncheck its checkbox.
