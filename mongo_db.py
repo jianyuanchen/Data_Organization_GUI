@@ -183,6 +183,55 @@ def fetch_records(query: dict | None = None, log=print) -> list[dict]:
     return records
 
 
+def fetch_record_by_id(existing_id: str, log=print) -> dict | None:
+    """Fetch ONE cloud document by its _id, INCLUDING its embedded spectra
+    arrays. Read-only; used by the conflict resolver's comparison view to load
+    the cloud side on demand (only for the conflict actually being viewed).
+
+    `existing_id` is the stringified ObjectId carried in a conflict descriptor.
+    Returns the document dict (with `_id` stringified) on success, or None on any
+    failure (unconfigured, malformed id, connect/timeout, query error, or not
+    found). Never raises -- a clear line is logged and None returned so the GUI
+    shows a "could not load" placeholder rather than crashing. pymongo + bson are
+    lazy-imported; the 5s fast-fail timeout rides on get_client; MONGODB_URI is
+    never logged.
+    """
+    if not config.mongo_configured():
+        log("MongoDB not configured -- set MONGODB_URI in .env.")
+        return None
+
+    # Stringified _id -> ObjectId so we address the exact document. bson ships
+    # with pymongo; lazy-import to keep the GUI launchable without it.
+    try:
+        from bson import ObjectId
+        oid = ObjectId(str(existing_id))
+    except Exception as e:
+        log(f"Invalid cloud _id {existing_id!r}: {type(e).__name__}: {e}")
+        return None
+
+    client = None
+    try:
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        doc = collection.find_one({"_id": oid})
+    except Exception as e:
+        log(f"Cloud fetch-by-id failed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    if doc is None:
+        log(f"No cloud record with _id {existing_id}.")
+        return None
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+
 def _is_confirmed(rec: dict) -> bool:
     """Eligible-for-promotion gate. Both flags must agree.
 
@@ -223,6 +272,30 @@ def _diff_fields(rec: dict, doc: dict) -> list:
     """
     keys = (set(rec.keys()) | set(doc.keys())) - _NON_COMPARABLE
     return sorted(k for k in keys if rec.get(k) != doc.get(k))
+
+
+def _build_cloud_doc(record: dict, wavelength, g, cd, uv, data_hash: str,
+                     fkey: str, filename: str, promoted_at: str) -> dict:
+    """Build the canonical stored cloud document from a local record + spectra.
+
+    Single source of truth for the doc shape so NEW inserts (promote_records)
+    and sanctioned overwrites (replace_by_id) stay schema-consistent: a replaced
+    doc is byte-for-byte the same shape as a freshly inserted one. Strips any
+    incoming _id -- insert_one assigns a fresh one; replace_one preserves the
+    matched doc's existing _id.
+    """
+    doc = dict(record)
+    doc.pop("_id", None)
+    doc["wavelength"] = list(wavelength)
+    doc["g"] = list(g)
+    doc["cd"] = list(cd)
+    doc["uv"] = list(uv)
+    doc["data_hash"] = data_hash
+    doc["filename_key"] = fkey
+    doc["filename"] = filename
+    doc["record_id"] = record.get("record_id")  # trace of machine, NOT a key
+    doc["promoted_at"] = promoted_at
+    return doc
 
 
 def promote_records(records: Iterable[dict], log=print) -> dict:
@@ -280,18 +353,16 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
                 "differing_fields": [str],  # metadata fields that disagree
                 "data_differs":     bool,   # spectral data/hash differs
             }, ... ],
-            # Legacy mirror of `conflicts`, kept so the current main_window
-            # (which still reads conflict_details) keeps surfacing conflict
-            # dialogs until it migrates to the richer `conflicts` list.
-            "conflict_details": [(kind, filename, existing_id, message), ...],
         }
     `promoted` is what the caller feeds back into the local DB (set promoted=1
     + promoted_at) -- inserts AND true-duplicates appear there, since both mean
-    "this record is in the cloud".
+    "this record is in the cloud". `conflicts` is consumed by the in-app
+    resolver (main_window._resolve_conflicts), which is the only thing that can
+    overwrite a cloud doc (via replace_by_id), so nobody edits Atlas by hand.
     """
     summary: dict = {
         "pushed": 0, "already": 0, "skipped": 0, "failed": 0,
-        "promoted": [], "conflicts": [], "conflict_details": [],
+        "promoted": [], "conflicts": [],
     }
 
     records = list(records)
@@ -389,7 +460,7 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
 
     def _record_conflict(rec, existing, fkey, filename, data_hash,
                          *, concurrent=False):
-        """Collect a rich conflict descriptor (+ a legacy detail tuple) and log.
+        """Collect a rich conflict descriptor for the in-app resolver and log.
         Never writes -- the differing cloud doc is left exactly as-is."""
         existing_id = existing.get("_id")
         summary["conflicts"].append({
@@ -400,19 +471,12 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
             "differing_fields": _diff_fields(rec, existing),
             "data_differs": existing.get("data_hash") != data_hash,
         })
-        msg = ("Filename matches an existing cloud record but the data "
-               f"differs. Existing record _id: {existing_id}. Please "
-               "double-check the filename -- same names should have the "
-               f"same data. Upload cancelled for {filename}.")
-        summary["conflict_details"].append(
-            ("name", filename, str(existing_id), msg))
         what = " (concurrent insert)" if concurrent else ""
         log(f"  CONFLICT{what} (filename matches, data differs): {filename} "
             f"-- existing _id: {existing_id} -- upload cancelled.")
 
     for rec in confirmed:
         csv_path = rec.get("csv_path")
-        rid = rec.get("record_id")
         # fkey (lowercased) is the identity key; filename keeps the original
         # case just for human-readable logs / messages and the stored doc.
         fkey = _filename_key(csv_path)
@@ -468,17 +532,10 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
                 f"filename {other_name} (_id {other.get('_id')}) -- "
                 f"inserting {filename} as new (different filename).")
 
-        doc = dict(rec)
-        doc.pop("_id", None)               # never carry in / regenerate an _id
-        doc["wavelength"] = list(wavelength)
-        doc["g"] = list(g)
-        doc["cd"] = list(cd)
-        doc["uv"] = list(uv)
-        doc["data_hash"] = data_hash
-        doc["filename_key"] = fkey
-        doc["filename"] = filename
-        doc["record_id"] = rid             # trace of promoting machine, NOT key
-        doc["promoted_at"] = promoted_at
+        # Same builder replace_by_id uses, so inserts and sanctioned
+        # overwrites produce identical doc shapes.
+        doc = _build_cloud_doc(rec, wavelength, g, cd, uv, data_hash, fkey,
+                               filename, promoted_at)
 
         try:
             collection.insert_one(doc)
@@ -523,3 +580,106 @@ def promote_records(records: Iterable[dict], log=print) -> dict:
         pass
 
     return summary
+
+
+def replace_by_id(existing_id: str, record: dict, log=print) -> dict:
+    """Overwrite ONE existing cloud doc -- addressed BY ITS _id -- with the
+    local record's full document. The ONLY sanctioned cloud-overwrite path
+    (the conflict resolver's "Replace Cloud with Local").
+
+    Targets _id, NEVER filename_key, so there is no ambiguity about which doc is
+    rewritten. Builds the stored document via _build_cloud_doc -- the same shape
+    promote_records' NEW-insert branch uses -- so a replaced doc is
+    schema-identical to a freshly inserted one (embedded arrays + data_hash +
+    filename_key + filename + provenance).
+
+    Never raises: every failure mode (unconfigured, bad _id, CSV read, connect,
+    replace error, or no matching doc) is captured into the returned dict, so the
+    GUI only ever sees a result -- never a pymongo traceback. MONGODB_URI is
+    never logged. pymongo + bson are lazy-imported; get_client carries the 5s
+    fast-fail timeout. Uses replace_one WITHOUT upsert: if the target doc was
+    deleted since the conflict was detected we report it, never silently
+    recreate it.
+
+    Returns {"ok": bool, "promoted_at": str|None, "message": str}. On ok=True the
+    caller mirrors promoted_at into local SQLite via db.mark_promoted.
+    """
+    result = {"ok": False, "promoted_at": None, "message": ""}
+
+    if not config.mongo_configured():
+        result["message"] = "MongoDB not configured -- set MONGODB_URI in .env."
+        log(result["message"])
+        return result
+
+    csv_path = record.get("csv_path")
+    filename = ((csv_path or "").replace("\\", "/").rsplit("/", 1)[-1]
+                or "(unknown)")
+
+    # Resolve the stringified _id back to an ObjectId so we target the exact
+    # doc. bson ships with pymongo; lazy-import to keep the GUI launchable.
+    try:
+        from bson import ObjectId
+        oid = ObjectId(str(existing_id))
+    except Exception as e:
+        result["message"] = (f"Invalid cloud _id {existing_id!r} -- nothing "
+                             f"replaced: {type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+
+    # Read + hash the local spectra exactly like the NEW-insert branch.
+    try:
+        from plotting import read_csv_columns
+    except Exception as e:
+        result["message"] = (f"Could not load CSV reader: "
+                             f"{type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+    try:
+        cols = read_csv_columns(csv_path)
+    except Exception as e:
+        result["message"] = (f"CSV read failed for {csv_path}: "
+                             f"{type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+    if not cols or len(cols) < 4:
+        result["message"] = f"CSV has no numeric data: {csv_path} -- skipped."
+        log(result["message"])
+        return result
+
+    wavelength, g, cd, uv = cols[0], cols[1], cols[2], cols[3]
+    data_hash = compute_data_hash(wavelength, g, cd, uv)
+    promoted_at = datetime.now(timezone.utc).isoformat()
+    doc = _build_cloud_doc(record, wavelength, g, cd, uv, data_hash,
+                           _filename_key(csv_path), filename, promoted_at)
+
+    client = None
+    try:
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        # replace_one (no upsert): rewrite the WHOLE matched doc, preserving its
+        # _id. matched_count==0 means the doc is gone -- report, don't recreate.
+        res = collection.replace_one({"_id": oid}, doc)
+        if res.matched_count == 0:
+            result["message"] = (f"No cloud record with _id {existing_id} "
+                                 f"(it may have been deleted) -- nothing "
+                                 f"replaced for {filename}.")
+            log(result["message"])
+            return result
+        result["ok"] = True
+        result["promoted_at"] = promoted_at
+        result["message"] = (f"Replaced cloud record _id {existing_id} with "
+                             f"local {filename}.")
+        log(result["message"])
+        return result
+    except Exception as e:
+        result["message"] = (f"Cloud replace failed for {filename}: "
+                             f"{type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass

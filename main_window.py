@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
-    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu,
+    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu, QDialog,
 )
 
 from models import COLUMNS, REVIEW_STATUS_COLORS, VISIBLE_COLUMNS, canon_path
@@ -66,6 +66,326 @@ def new_batch_id() -> str:
     """
     return (datetime.now().isoformat(timespec="seconds")
             + "_" + uuid.uuid4().hex[:8])
+
+
+# --- conflict-resolver comparison view ------------------------------------
+# Lazy, on-demand loaders + a per-conflict dialog that shows HOW the cloud and
+# local records differ (metadata table + per-signal numeric verdict + overlay
+# plot) before the user chooses Keep / Replace / Skip. The ~800-point arrays are
+# pulled only for the conflict being viewed -- never carried in the conflicts
+# list. Every load is guarded so the dialog degrades to a placeholder, never a
+# crash, and never blocks the three action buttons.
+
+def _arrays_from_doc(doc: dict):
+    """Pull {wavelength, cd, g, uv} float lists from a cloud document, or None
+    if it has no usable wavelength array. Defensive float coercion; the keys
+    match what promote_records / _build_cloud_doc store."""
+    if not doc:
+        return None
+    try:
+        out = {k: [float(v) for v in (doc.get(k) or [])]
+               for k in ("wavelength", "cd", "g", "uv")}
+    except (TypeError, ValueError):
+        return None
+    return out if out["wavelength"] else None
+
+
+def _arrays_from_csv(csv_path: str, log=print):
+    """Read the local CSV via the SAME reader promote uses and return
+    {wavelength, cd, g, uv} float lists, or None on any failure. read_csv_columns
+    yields [wavelength, g, cd, uv] (note order); we remap to the dict by name."""
+    if not csv_path:
+        return None
+    try:
+        from plotting import read_csv_columns
+        cols = read_csv_columns(csv_path)
+    except Exception as e:
+        log(f"  (local data load failed for {csv_path}: "
+            f"{type(e).__name__}: {e})")
+        return None
+    if not cols or len(cols) < 4:
+        return None
+    try:
+        wl = [float(v) for v in cols[0]]
+        g = [float(v) for v in cols[1]]
+        cd = [float(v) for v in cols[2]]
+        uv = [float(v) for v in cols[3]]
+    except (TypeError, ValueError):
+        return None
+    return {"wavelength": wl, "cd": cd, "g": g, "uv": uv} if wl else None
+
+
+def _conflict_cloud_doc(existing_id: str, log=print):
+    """Fetch the existing cloud doc (metadata + embedded arrays) by its _id,
+    via mongo_db so no raw pymongo lives here. Returns the doc or None; never
+    raises (fetch_record_by_id captures every failure into None)."""
+    try:
+        from mongo_db import fetch_record_by_id
+    except Exception as e:
+        log(f"  (cloud import failed, comparison unavailable: "
+            f"{type(e).__name__}: {e})")
+        return None
+    return fetch_record_by_id(existing_id, log=log)
+
+
+class _ConflictResolveDialog(QDialog):
+    """One conflict's comparison + decision. Shows a metadata diff table, a
+    per-signal numeric verdict, and a cloud-vs-local overlay plot, then exposes
+    the user's choice via ``chosen_action`` ('keep' | 'replace' | 'skip').
+
+    Pure presentation: it performs NO cloud writes. The caller
+    (_resolve_conflicts) keeps the confirm + replace_by_id + mark_promoted logic
+    unchanged and just reads chosen_action. Closing the dialog defaults to
+    'keep' (the safe, non-destructive choice)."""
+
+    _SIG_ORDER = ("CD", "g", "UV")
+    _SIG_KEY = {"CD": "cd", "g": "g", "UV": "uv"}
+    _SIG_TITLE = {"CD": "CD (mdeg)", "g": "g-value", "UV": "UV-Vis (abs)"}
+    _CLOUD_COLOR = "tab:orange"
+    _LOCAL_COLOR = "tab:blue"
+    _WL_TOL = 0.5            # nm: wavelength grids "match" within this per point
+    _REL_TOL = 0.01          # material if max|Δ| > 1% of the signal's peak
+    _ABS_FLOOR = 1e-12       # guards near-zero signals from a zero threshold
+    _X_RANGE = (300, 700)
+    _DIFF_TINT = QColor("#fff3cd")
+
+    def __init__(self, conflict: dict, *, log=print, parent=None):
+        super().__init__(parent)
+        self._log = log
+        self.chosen_action = "keep"        # default / dialog-closed = keep cloud
+        self.setWindowTitle("Resolve cloud conflict")
+        self.setModal(True)
+        self.resize(900, 780)
+
+        filename = conflict.get("filename") or "(unknown)"
+        existing_id = conflict.get("existing_id")
+        record = conflict.get("record") or {}
+        diffs = conflict.get("differing_fields") or []
+
+        # Lazy, guarded data load -- arrays only for THIS conflict. One fetch
+        # gets the cloud doc's metadata AND arrays; the local side comes from
+        # the same CSV reader promote uses.
+        cloud_doc = _conflict_cloud_doc(existing_id, log)
+        self._cloud = _arrays_from_doc(cloud_doc)
+        self._local = _arrays_from_csv(record.get("csv_path"), log)
+        # Precompute the per-signal verdicts once; the plot reuses each signal's
+        # divergence threshold for its shaded band.
+        self._verdicts = {s: self._compute_verdict(s) for s in self._SIG_ORDER}
+
+        root = QVBoxLayout(self)
+
+        head = QLabel(
+            f"<b>{filename}</b><br>"
+            f"A cloud record with this filename already exists with "
+            f"<b>DIFFERENT spectral data</b>.<br>"
+            f"Existing cloud record _id: <code>{existing_id}</code>")
+        head.setTextFormat(Qt.TextFormat.RichText)
+        head.setWordWrap(True)
+        root.addWidget(head)
+
+        root.addWidget(self._build_meta_widget(diffs, cloud_doc, record))
+        root.addWidget(self._build_verdict_widget())
+        root.addWidget(self._build_plot_widget(), stretch=1)
+        root.addLayout(self._build_buttons())
+
+    # ---- level 1: metadata diff ------------------------------------------
+    def _build_meta_widget(self, diffs, cloud_doc, record):
+        if not diffs:
+            lab = QLabel("Metadata matches — only the spectral data differs "
+                         "(the common case). See the comparison below.")
+            lab.setStyleSheet("color:#555;font-style:italic;")
+            lab.setWordWrap(True)
+            return lab
+        table = QTableWidget(len(diffs), 3)
+        table.setHorizontalHeaderLabels(["Field", "Cloud", "Local"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        cloud_loaded = cloud_doc is not None
+        for r, field in enumerate(diffs):
+            cloud_val = ("(cloud not loaded)" if not cloud_loaded
+                         else ("" if cloud_doc.get(field) is None
+                               else str(cloud_doc.get(field))))
+            local_val = ("" if record.get(field) is None
+                         else str(record.get(field)))
+            name_item = QTableWidgetItem(str(field))
+            cloud_item = QTableWidgetItem(cloud_val)
+            local_item = QTableWidgetItem(local_val)
+            # Every row IS a differing field -> highlight both value cells.
+            cloud_item.setBackground(QBrush(self._DIFF_TINT))
+            local_item.setBackground(QBrush(self._DIFF_TINT))
+            table.setItem(r, 0, name_item)
+            table.setItem(r, 1, cloud_item)
+            table.setItem(r, 2, local_item)
+        # Cap height so the table never crowds out the plot.
+        row_h = table.verticalHeader().defaultSectionSize()
+        header_h = table.horizontalHeader().height()
+        table.setMaximumHeight(min(len(diffs), 5) * row_h + header_h + 8)
+        return table
+
+    # ---- level 2: per-signal numeric verdict -----------------------------
+    def _compute_verdict(self, sig: str) -> dict:
+        """Cheap, decisive numeric comparison for one signal.
+
+        Grid check first: same point count AND wavelengths aligned within tol.
+        Matched grids -> max|Δ|, wavelength at max, RMS, and a material flag
+        (vs a 1%-of-peak threshold). Mismatched grids -> the mismatch itself is
+        the finding (no element-wise subtraction)."""
+        key = self._SIG_KEY[sig]
+        if not self._cloud or not self._local:
+            return {"text": f"{sig}: data not loaded", "material": False,
+                    "grid_match": False}
+        c_y = self._cloud.get(key) or []
+        l_y = self._local.get(key) or []
+        c_wl = self._cloud.get("wavelength") or []
+        l_wl = self._local.get("wavelength") or []
+        nc, nl = len(c_y), len(l_y)
+        if nc == 0 or nl == 0:
+            return {"text": f"{sig}: missing array (cloud {nc} pts vs local "
+                            f"{nl} pts)", "material": True, "grid_match": False}
+        grid_match = (nc == nl and len(c_wl) >= nc and len(l_wl) >= nc
+                      and all(abs(c_wl[i] - l_wl[i]) <= self._WL_TOL
+                              for i in range(nc)))
+        if not grid_match:
+            return {"text": f"{sig}: grid mismatch — cloud {nc} pts vs local "
+                            f"{nl} pts", "material": True, "grid_match": False}
+        diffs = [abs(l_y[i] - c_y[i]) for i in range(nc)]
+        maxd = max(diffs)
+        at_wl = c_wl[diffs.index(maxd)]
+        rms = (sum(d * d for d in diffs) / nc) ** 0.5
+        ref = max(max(abs(v) for v in c_y), max(abs(v) for v in l_y),
+                  self._ABS_FLOOR)
+        threshold = max(self._REL_TOL * ref, self._ABS_FLOOR)
+        return {"text": f"{sig}: max Δ {maxd:.4g} @ {at_wl:.0f} nm, "
+                        f"RMS {rms:.4g}",
+                "material": maxd > threshold, "grid_match": True,
+                "threshold": threshold}
+
+    def _build_verdict_widget(self):
+        box = QGroupBox("Per-signal numeric comparison (cloud vs local)")
+        v = QVBoxLayout(box)
+        for sig in self._SIG_ORDER:
+            verdict = self._verdicts[sig]
+            lab = QLabel(verdict["text"])
+            if verdict["material"]:
+                lab.setStyleSheet("color:#b00020;font-weight:bold;")  # differs
+            elif verdict.get("grid_match"):
+                lab.setStyleSheet("color:#1b7a3d;")                    # trivial
+            else:
+                lab.setStyleSheet("color:#555;")
+            v.addWidget(lab)
+        return box
+
+    # ---- level 3: overlay plot -------------------------------------------
+    def _placeholder(self, msg: str):
+        lab = QLabel(msg)
+        lab.setWordWrap(True)
+        lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lab.setStyleSheet("color:#888;font-style:italic;padding:24px;")
+        lab.setMinimumHeight(140)
+        return lab
+
+    def _build_plot_widget(self):
+        # Plot needs BOTH sides loaded; if either failed, a placeholder stands
+        # in and the action buttons remain fully usable.
+        if self._cloud is None or self._local is None:
+            return self._placeholder(
+                "Could not load spectral data for one or both sides — "
+                "comparison plot unavailable. You can still Keep / Replace / "
+                "Skip below.")
+        # Lazy matplotlib import so the GUI still launches without it.
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        except Exception as e:
+            self._log(f"  (comparison plot unavailable: "
+                      f"{type(e).__name__}: {e})")
+            return self._placeholder(
+                "matplotlib not available — comparison plot disabled. You can "
+                "still Keep / Replace / Skip below.")
+        try:
+            fig = Figure(tight_layout=True)
+            canvas = FigureCanvasQTAgg(fig)
+            canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Expanding)
+            axes = fig.subplots(3, 1, sharex=True)
+            for ax, sig in zip(axes, self._SIG_ORDER):
+                key = self._SIG_KEY[sig]
+                c_wl, c_y = self._cloud["wavelength"], self._cloud.get(key) or []
+                l_wl, l_y = self._local["wavelength"], self._local.get(key) or []
+                # Plot each as (wavelength, value) so unequal lengths still draw
+                # -- matched grids are NOT required for the overlay.
+                nc = min(len(c_wl), len(c_y))
+                nl = min(len(l_wl), len(l_y))
+                if nc:
+                    ax.plot(c_wl[:nc], c_y[:nc], color=self._CLOUD_COLOR,
+                            linewidth=1.5, label="Cloud")
+                if nl:
+                    ax.plot(l_wl[:nl], l_y[:nl], color=self._LOCAL_COLOR,
+                            linewidth=1.2, label="Local")
+                self._shade_divergence(ax, sig)
+                ax.set_ylabel(sig)
+                ax.set_title(self._SIG_TITLE[sig], fontsize=10)
+                ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+                if nc or nl:
+                    ax.legend(loc="upper right", fontsize=8)
+            axes[0].set_xlim(*self._X_RANGE)     # sharex propagates to g + uv
+            axes[-1].set_xlabel("Wavelength (nm)")
+            canvas.draw_idle()
+            return canvas
+        except Exception as e:
+            self._log(f"  (comparison plot failed: {type(e).__name__}: {e})")
+            return self._placeholder(
+                "Comparison plot failed to render. You can still "
+                "Keep / Replace / Skip below.")
+
+    def _shade_divergence(self, ax, sig: str):
+        """Shade x-regions where |local − cloud| exceeds the signal's material
+        threshold, so the eye jumps to the divergence. Only meaningful when the
+        grids match (element-wise diff defined); a no-op otherwise."""
+        v = self._verdicts.get(sig) or {}
+        threshold = v.get("threshold")
+        if not v.get("grid_match") or threshold is None:
+            return
+        key = self._SIG_KEY[sig]
+        c_wl = self._cloud["wavelength"]
+        c_y = self._cloud.get(key) or []
+        l_y = self._local.get(key) or []
+        n = min(len(c_wl), len(c_y), len(l_y))
+        start = None
+        for i in range(n):
+            over = abs(l_y[i] - c_y[i]) > threshold
+            if over and start is None:
+                start = c_wl[i]
+            elif not over and start is not None:
+                ax.axvspan(start, c_wl[i], alpha=0.15, color="#d62728",
+                           zorder=0)
+                start = None
+        if start is not None and n:
+            ax.axvspan(start, c_wl[n - 1], alpha=0.15, color="#d62728",
+                       zorder=0)
+
+    # ---- decision buttons -------------------------------------------------
+    def _build_buttons(self):
+        row = QHBoxLayout()
+        row.addStretch(1)
+        keep = QPushButton("Keep Cloud")
+        keep.clicked.connect(lambda: self._choose("keep"))
+        replace = QPushButton("Replace Cloud with Local")
+        replace.setStyleSheet("font-weight:bold;")
+        replace.clicked.connect(lambda: self._choose("replace"))
+        skip = QPushButton("Skip / decide later")
+        skip.clicked.connect(lambda: self._choose("skip"))
+        keep.setDefault(True)
+        for b in (keep, replace, skip):
+            row.addWidget(b)
+        return row
+
+    def _choose(self, action: str):
+        self.chosen_action = action
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -1241,7 +1561,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         summary = {"pushed": 0, "already": 0, "conflicts": [], "skipped": 0,
-                   "failed": 0, "promoted": [], "conflict_details": []}
+                   "failed": 0, "promoted": []}
         try:
             summary = promote_records(records, log=self.log)
         except Exception as e:
@@ -1267,32 +1587,29 @@ class MainWindow(QMainWindow):
                     f"  could not mark promoted locally for {csv_path}: "
                     f"{type(e).__name__}: {e}")
 
-        # Surface each cross-machine conflict as a modal error dialog. The
-        # write was already cancelled server-side -- nothing was overwritten.
-        # Main thread (we're in the GUI handler), so this is safe.
-        for _kind, _filename, _existing_id, message in summary.get(
-                "conflict_details", []):
-            QMessageBox.critical(self, "Cloud upload cancelled", message)
-
         self.log(
             f"Promote summary: inserted {summary['pushed']}, "
             f"already-present {summary['already']}, "
-            f"cancelled {len(summary['conflicts'])} (conflicts), "
+            f"conflicts {len(summary['conflicts'])}, "
             f"skipped {summary['skipped']} (not confirmed), "
             f"failed {summary['failed']}.")
-        # Permanent record of which cloud doc to check for each cancelled
-        # conflict: filename + the existing record's _id.
-        for _kind, filename, existing_id, _msg in summary.get(
-                "conflict_details", []):
-            self.log(
-                f"  cancelled (conflict): {filename} -- existing _id: "
-                f"{existing_id}")
 
-        # Indicator: errors if anything failed OR a conflict was cancelled;
-        # connected if anything landed (insert or already-present); neutral if
-        # there was simply nothing eligible.
-        landed = summary["pushed"] + summary["already"]
-        if summary["failed"] or summary["conflicts"]:
+        # In-app conflict resolver: records whose filename_key already exists in
+        # Atlas with DIFFERENT spectral data (promote_records refused to
+        # overwrite them). The user resolves each interactively here so nobody
+        # has to hand-edit the Atlas Data Explorer. Replace-by-_id (inside the
+        # resolver, via mongo_db) is the ONLY path that overwrites a cloud doc.
+        resolution = {"replaced": 0, "replace_failed": 0}
+        if summary["conflicts"]:
+            resolution = self._resolve_conflicts(summary["conflicts"])
+
+        # Indicator. Conflicts are resolved interactively above (keep / replace
+        # / skip), so they are no longer treated as errors; only hard failures
+        # (CSV/connect/insert, or a failed replace) turn it red. A replaced doc
+        # counts as landed -- the local copy is now the cloud record.
+        landed = (summary["pushed"] + summary["already"]
+                  + resolution["replaced"])
+        if summary["failed"] or resolution["replace_failed"]:
             self._set_cloud_status("failed", "Cloud: errors (see log)")
         elif landed > 0:
             self._set_cloud_status("connected", "Cloud: connected")
@@ -1300,6 +1617,97 @@ class MainWindow(QMainWindow):
             self._set_cloud_status("neutral", "Cloud: idle")
 
         self.refresh_table()
+
+    def _resolve_conflicts(self, conflicts) -> dict:
+        """Walk each filename_key conflict and let the user resolve it in-app,
+        so nobody has to hand-edit documents in the Atlas Data Explorer.
+
+        Each conflict is a descriptor from promote_records: a local record whose
+        filename_key already exists in the cloud with DIFFERENT spectral data.
+        Per conflict, three actions:
+
+          Keep Cloud            -> cloud wins; skip the local record. (also the
+                                   default and the dialog-closed path)
+          Replace Cloud w/Local -> the ONLY overwrite path. Confirm, then
+                                   mongo_db.replace_by_id targeting the existing
+                                   doc's _id; on success mirror promoted_at into
+                                   local SQLite via db.mark_promoted.
+          Skip / decide later   -> leave both unchanged.
+
+        Returns {"replaced": int, "replace_failed": int}. Logs one clear outcome
+        line per conflict. All cloud access goes through mongo_db (lazy-imported
+        here), so the GUI never touches raw pymongo.
+        """
+        outcome = {"replaced": 0, "replace_failed": 0}
+
+        # Lazy import: keep the GUI importable without pymongo / .env. If it
+        # fails we can't replace anything -- treat every conflict as "kept".
+        try:
+            from mongo_db import replace_by_id
+        except Exception as e:
+            self.log(f"Cannot resolve conflicts (cloud import failed): "
+                     f"{type(e).__name__}: {e}")
+            for c in conflicts:
+                self.log(f"  conflict: kept cloud (cannot replace): "
+                         f"{c.get('filename') or '(unknown)'}")
+            return outcome
+
+        for c in conflicts:
+            filename = c.get("filename") or "(unknown)"
+            existing_id = c.get("existing_id")
+            record = c.get("record") or {}
+
+            # Comparison dialog: metadata diff + per-signal numeric verdict +
+            # cloud-vs-local overlay plot, so the user can SEE the difference
+            # first. It performs NO cloud writes -- it only collects the choice
+            # ('keep' | 'replace' | 'skip'); the replace logic below is
+            # unchanged. Arrays are loaded lazily inside, only for this conflict.
+            dlg = _ConflictResolveDialog(c, log=self.log, parent=self)
+            dlg.exec()
+            action = dlg.chosen_action
+
+            if action == "replace":
+                confirm = QMessageBox.question(
+                    self,
+                    "Overwrite cloud record?",
+                    f"This OVERWRITES the existing cloud record (_id "
+                    f"{existing_id}) with your local copy of {filename}.\n\n"
+                    f"This is the only action that changes a cloud document, "
+                    f"and it cannot be undone. Continue?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if confirm != QMessageBox.StandardButton.Yes:
+                    self.log(f"  conflict: replace cancelled, left unchanged: "
+                             f"{filename}")
+                    continue
+                # All raw pymongo lives in mongo_db.replace_by_id; it never
+                # raises -- a dict result carries ok / promoted_at / message.
+                res = replace_by_id(existing_id, record, log=self.log)
+                if res.get("ok"):
+                    outcome["replaced"] += 1
+                    csv_path = record.get("csv_path")
+                    promoted_at = res.get("promoted_at")
+                    if csv_path and promoted_at:
+                        try:
+                            self.db.mark_promoted(csv_path, promoted_at)
+                        except Exception as e:
+                            self.log(f"  could not mark promoted locally for "
+                                     f"{csv_path}: {type(e).__name__}: {e}")
+                    self.log(f"  conflict RESOLVED -- replaced cloud with "
+                             f"local: {filename}")
+                else:
+                    outcome["replace_failed"] += 1
+                    self.log(f"  conflict: replace FAILED, cloud unchanged: "
+                             f"{filename}")
+            elif action == "skip":
+                self.log(f"  conflict: skipped (decide later), both unchanged: "
+                         f"{filename}")
+            else:
+                # Keep Cloud -- also the default and the dialog-closed path.
+                self.log(f"  conflict: kept cloud, local skipped: {filename}")
+
+        return outcome
 
     def startup_origin_check(self):
         """Startup probe: attach if Origin is already open, otherwise stay
