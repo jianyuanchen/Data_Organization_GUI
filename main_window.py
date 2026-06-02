@@ -1153,6 +1153,14 @@ class MainWindow(QMainWindow):
             return
 
         self.log(f"Deleted {n} local record(s).")
+        # Rebuild the View dropdown BEFORE the table. batches_summary() is
+        # computed from live scans rows, so a batch whose last row we just
+        # deleted vanishes from the list here. _refresh_view_options preserves
+        # the current selection when its batch still has rows, and falls back
+        # to "All records" (resetting _active_view) when the active batch is
+        # now empty -- so doing this first means the subsequent refresh_table
+        # renders the corrected view instead of the just-emptied batch.
+        self._refresh_view_options()
         self.refresh_table()
         self.refresh_filter_options()
 
