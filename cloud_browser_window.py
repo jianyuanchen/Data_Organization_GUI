@@ -30,7 +30,8 @@ from PyQt6.QtWidgets import (
 
 import numpy as np
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import (
+    FigureCanvasQTAgg, NavigationToolbar2QT)
 
 from models import VISIBLE_COLUMNS
 
@@ -301,6 +302,27 @@ class CloudBrowserWindow(QDialog):
         self._sig_axes = {"CD": self.ax_cd, "g": self.ax_g, "UV": self.ax_uv}
         self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
         plot_v.addWidget(self.canvas, stretch=1)
+
+        # View-only zoom/pan toolbar. matplotlib's NavigationToolbar2QT gives
+        # rectangle (box) zoom, pan, back/forward history and a home button.
+        # Because the three subplots share their x-axis (sharex=True), a
+        # box-zoom on any subplot zooms the wavelength (x) range on ALL three
+        # together, while the y-zoom applies only to the subplot the box was
+        # drawn on -- so the user can rescale just the g-value y-axis to see
+        # real peaks past ~550 nm without disturbing CD/UV. STRICTLY view-only:
+        # it changes the displayed axis limits only, never the stored data.
+        toolbar_row = QHBoxLayout()
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        toolbar_row.addWidget(self.toolbar)
+        toolbar_row.addStretch(1)
+        self.reset_view_btn = QPushButton("Reset View (full spectrum)")
+        self.reset_view_btn.setToolTip(
+            "Restore all three subplots to the full wavelength range and "
+            "auto y-scale (same as the toolbar's home button). View-only -- "
+            "no data is changed.")
+        self.reset_view_btn.clicked.connect(self._reset_view)
+        toolbar_row.addWidget(self.reset_view_btn)
+        plot_v.addLayout(toolbar_row)
 
         ctl_row = QHBoxLayout()
         ctl_row.addWidget(QLabel("Active:"))
@@ -695,6 +717,7 @@ class CloudBrowserWindow(QDialog):
         self._set_peak_controls_enabled(True)
         self._draw_axes_chrome()
         self._draw_highlight_band()
+        self._reset_nav_history()
         self.canvas.draw_idle()
 
     def _show_no_data(self, msg: str):
@@ -705,6 +728,30 @@ class CloudBrowserWindow(QDialog):
                     transform=ax.transAxes, color="#888888",
                     style="italic", fontsize=10)
         self._draw_axes_chrome()
+        self._reset_nav_history()
+        self.canvas.draw_idle()
+
+    def _reset_nav_history(self):
+        """Clear the zoom/pan toolbar's view stack so a new record starts at
+        its own full view -- a previous record's zoom can't be reached via the
+        toolbar's Home / back / forward buttons. Safe to call before the
+        toolbar exists (during the initial build)."""
+        tb = getattr(self, "toolbar", None)
+        if tb is not None:
+            tb.update()
+
+    def _reset_view(self):
+        """Restore the full default view on all three subplots: full
+        wavelength (x) range + auto y-scale per subplot. STRICTLY view-only --
+        only the displayed axis limits change; no data, peak value, or stored
+        array is touched. Also resets the toolbar's view history so its Home
+        button agrees with this full view.
+        """
+        for ax in self._sig_axes.values():
+            ax.relim()
+            ax.autoscale(axis="y")
+        self.ax_cd.set_xlim(*_PLOT_X_RANGE)   # sharex propagates to g + uv
+        self._reset_nav_history()
         self.canvas.draw_idle()
 
     def _draw_axes_chrome(self):
