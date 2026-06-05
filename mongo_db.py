@@ -683,3 +683,135 @@ def replace_by_id(existing_id: str, record: dict, log=print) -> dict:
                 client.close()
             except Exception:
                 pass
+
+
+# ===========================================================================
+# CLASSIFICATION TAGS  (additive, keyed by record_id -- never touch spectra)
+# ===========================================================================
+# The CD-shape review window (Phase B) writes two ADDITIVE fields back onto each
+# cloud doc, addressed by record_id:
+#   - auto_classification : a REFRESHABLE CACHE of the classifier's output
+#     (label + borderline + key metrics + the thresholds snapshot). Re-synced
+#     whenever classifier.py's PROVISIONAL thresholds change; the pass is
+#     idempotent and re-runnable.
+#   - human_classification: the DURABLE reviewer override (Ladder/Staircase/
+#     Unsure + timestamp), independent of threshold changes.
+# Both are pure $set of a single field -- the spectral arrays and every other
+# field are left exactly as-is. Neither function ever raises; failures are
+# logged and reported in the return value so the GUI never crashes on a cloud
+# hiccup. record_id is the key per the persistence contract; one cloud doc per
+# filename_key means it addresses a single document.
+
+
+def sync_auto_classifications(updates, log=print) -> dict:
+    """Additively cache the classifier's auto labels onto cloud docs, keyed by
+    record_id. ONLY the `auto_classification` field is $set -- spectra and all
+    other fields are untouched. Idempotent and re-runnable: safe to call after
+    every classify pass (e.g. once classifier.py's thresholds change).
+
+    `updates`: iterable of (record_id, auto_doc) pairs. A pair with a falsy
+    record_id is skipped (a doc with no record_id can't be addressed this way).
+
+    Returns {"matched": int, "modified": int, "skipped": int, "failed": int}.
+    Never raises -- a connect/query error logs a line and counts the batch as
+    failed.
+    """
+    summary = {"matched": 0, "modified": 0, "skipped": 0, "failed": 0}
+
+    ops_in = list(updates)
+    ops = []
+    for rid, auto in ops_in:
+        if not rid:
+            summary["skipped"] += 1
+            continue
+        ops.append((rid, auto))
+
+    if not ops:
+        if ops_in:
+            log(f"  auto-classification sync: {summary['skipped']} skipped "
+                f"(no record_id); nothing to write.")
+        return summary
+
+    if not config.mongo_configured():
+        log("MongoDB not configured -- cannot sync auto-classifications.")
+        summary["failed"] += len(ops)
+        return summary
+
+    client = None
+    try:
+        from pymongo import UpdateOne
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        bulk = [UpdateOne({"record_id": rid},
+                          {"$set": {"auto_classification": auto}})
+                for rid, auto in ops]
+        res = collection.bulk_write(bulk, ordered=False)
+        summary["matched"] = res.matched_count
+        summary["modified"] = res.modified_count
+        tail = (f"; {summary['skipped']} skipped (no record_id)"
+                if summary["skipped"] else "")
+        log(f"  auto-classification sync: matched {res.matched_count}, "
+            f"modified {res.modified_count}{tail}.")
+    except Exception as e:
+        log(f"Auto-classification sync failed: {type(e).__name__}: {e}")
+        summary["failed"] += len(ops)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return summary
+
+
+def set_human_classification(record_id, human_doc, log=print) -> dict:
+    """Write the durable human override onto ONE cloud doc, keyed by record_id.
+    ONLY the `human_classification` field is $set -- the auto label and the
+    spectra are left intact. update_one without upsert: if no doc has this
+    record_id we report it, never create one.
+
+    Returns {"ok": bool, "message": str}. Never raises.
+    """
+    result = {"ok": False, "message": ""}
+
+    if not record_id:
+        result["message"] = "No record_id -- cannot save human classification."
+        log(result["message"])
+        return result
+    if not config.mongo_configured():
+        result["message"] = ("MongoDB not configured -- human classification "
+                             "not saved.")
+        log(result["message"])
+        return result
+
+    client = None
+    try:
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        res = collection.update_one(
+            {"record_id": record_id},
+            {"$set": {"human_classification": human_doc}})
+        if res.matched_count == 0:
+            result["message"] = (f"No cloud record with record_id "
+                                 f"{record_id} -- override not saved.")
+            log(result["message"])
+            return result
+        result["ok"] = True
+        result["message"] = (f"Saved human classification "
+                             f"'{human_doc.get('label')}' for record_id "
+                             f"{record_id}.")
+        log(result["message"])
+        return result
+    except Exception as e:
+        result["message"] = (f"Saving human classification failed: "
+                             f"{type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass

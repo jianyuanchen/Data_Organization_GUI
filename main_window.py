@@ -412,6 +412,10 @@ class MainWindow(QMainWindow):
         # Single read-only CloudBrowserWindow instance, same lifecycle as the
         # verification window (kept alive non-modally; re-clicks raise it).
         self._cloud_browser_win = None
+        # Single CDReviewWindow (Phase B classifier review) instance, same
+        # non-modal lifecycle. Reads verified cloud records; its only cloud
+        # writes are the additive auto_/human_classification tags.
+        self._cd_review_win = None
         # Origin launch ownership: True ONLY when THIS app spawned the Origin
         # process (the launch branch of Connect). Stays False when we merely
         # attach to an Origin that was already running. Drives Close Origin's
@@ -568,6 +572,13 @@ class MainWindow(QMainWindow):
             "Atlas and plot their embedded spectra. No editing -- corrections "
             "happen by re-promoting a local record.")
         browse_cloud.clicked.connect(self.on_browse_cloud)
+        cd_review = QPushButton("CD Review")
+        cd_review.setToolTip(
+            "Open the CD-shape review window: classify the verified cloud "
+            "records as ladder vs staircase (Phase A classifier), audit each "
+            "decision, and record a human override. Spectra are never "
+            "modified.")
+        cd_review.clicked.connect(self.on_open_cd_review)
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
@@ -583,6 +594,7 @@ class MainWindow(QMainWindow):
         h.addSpacing(10)
         h.addWidget(test_cloud)
         h.addWidget(browse_cloud)
+        h.addWidget(cd_review)
         h.addWidget(self.cloud_status)
         return box
 
@@ -1390,6 +1402,43 @@ class MainWindow(QMainWindow):
         read-only and never touches the local DB.
         """
         self._cloud_browser_win = None
+
+    def on_open_cd_review(self):
+        """Open the CD-shape review window (Phase B). Reuses an open window
+        (raise to front) like the others. Reads verified cloud records and
+        classifies them; the window handles fetch/classify failures internally
+        (clear empty state), so the app never crashes if the cloud is
+        unconfigured/unreachable. Its only cloud writes are the additive
+        auto_/human_classification tags -- spectra are never touched.
+        """
+        if (self._cd_review_win is not None
+                and self._cd_review_win.isVisible()):
+            self._cd_review_win.raise_()
+            self._cd_review_win.activateWindow()
+            self.log("CD review window already open; raised to front.")
+            return
+
+        # Lazy import so the GUI launches even if matplotlib / pymongo aren't
+        # importable -- the failure surfaces here as a log line, not a crash.
+        try:
+            from cd_review_window import CDReviewWindow
+        except Exception as e:
+            self.log(
+                f"Failed to open CD review window: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+            return
+
+        self._cd_review_win = CDReviewWindow(log=self.log, parent=self)
+        self._cd_review_win.finished.connect(
+            lambda *_args: self._after_cd_review())
+        self._cd_review_win.show()
+        self.log("Opened CD-shape review window.")
+
+    def _after_cd_review(self):
+        """Drop the cached CD-review reference on close so the next click builds
+        a fresh window. The local DB is untouched (the window reads/writes only
+        the cloud's additive classification tags)."""
+        self._cd_review_win = None
 
     def on_promote_batch(self):
         """Promote all confirmed records in the currently-viewed batch.
