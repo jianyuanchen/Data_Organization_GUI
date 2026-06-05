@@ -815,3 +815,71 @@ def set_human_classification(record_id, human_doc, log=print) -> dict:
                 client.close()
             except Exception:
                 pass
+
+
+def set_manual_window(record_id, manual_window, auto_doc, log=print) -> dict:
+    """Persist a per-record manual CD window AND its refreshed auto cache TOGETHER
+    on ONE cloud doc, keyed by record_id, in a single atomic update.
+
+    auto_classification is a cache derived from BOTH the provisional constants
+    AND the window used, so the two must never be written out of sync. The
+    caller recomputes the classification under the new window and hands us both:
+
+      - `manual_window`: a {"min_nm", "max_nm"} dict to SET, or None to CLEAR
+        (revert the record to the data-driven window). Clearing $unsets the
+        field so it disappears from the doc rather than lingering as null.
+      - `auto_doc`: the refreshed classifier.auto_classification_doc(result),
+        always $set so the stored cache matches the window just chosen.
+
+    update_one without upsert: a missing record_id is reported, never created.
+    Returns {"ok": bool, "message": str}. Never raises.
+    """
+    result = {"ok": False, "message": ""}
+
+    if not record_id:
+        result["message"] = "No record_id -- cannot save manual window."
+        log(result["message"])
+        return result
+    if not config.mongo_configured():
+        result["message"] = ("MongoDB not configured -- manual window not "
+                             "saved.")
+        log(result["message"])
+        return result
+
+    # Build ONE update so manual_window and the cache land together.
+    update: dict = {"$set": {"auto_classification": auto_doc}}
+    if manual_window is None:
+        update["$unset"] = {"manual_window": ""}
+        action = "cleared (reverted to data-driven)"
+    else:
+        update["$set"]["manual_window"] = manual_window
+        action = (f"set [{manual_window.get('min_nm')}-"
+                  f"{manual_window.get('max_nm')}] nm")
+
+    client = None
+    try:
+        client = get_client()
+        collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
+        client.admin.command("ping")
+        res = collection.update_one({"record_id": record_id}, update)
+        if res.matched_count == 0:
+            result["message"] = (f"No cloud record with record_id "
+                                 f"{record_id} -- manual window not saved.")
+            log(result["message"])
+            return result
+        result["ok"] = True
+        result["message"] = (f"Manual window {action} for record_id "
+                             f"{record_id} (auto cache refreshed).")
+        log(result["message"])
+        return result
+    except Exception as e:
+        result["message"] = (f"Saving manual window failed: "
+                             f"{type(e).__name__}: {e}")
+        log(result["message"])
+        return result
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass

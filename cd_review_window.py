@@ -19,13 +19,20 @@ REASONING auditable.
 WRITES (the only ones this window performs -- spectra are NEVER touched):
   - auto_classification : refreshable cache of the classifier output, synced to
     each cloud doc keyed by record_id. Idempotent; re-synced when stale (e.g.
-    after the PROVISIONAL thresholds in classifier.py change).
+    after the PROVISIONAL thresholds in classifier.py change, OR when a record's
+    manual_window changes -- the cache records window_used and is invalidated by
+    a window edit).
+  - manual_window       : per-record CD analysis window {min_nm, max_nm} set via
+    the dual-handle range slider. Overrides the data-driven window. Persisted
+    TOGETHER with a freshly recomputed auto_classification (one atomic write via
+    mongo_db.set_manual_window) so the two never drift out of sync. "Reset to
+    auto" $unsets it and reverts the record to the data-driven window.
   - human_classification: durable reviewer override (Ladder/Staircase/Unsure +
     timestamp), written on demand. Never overwrites the auto label -- both are
     kept side by side; disagreements are surfaced as the tuning signal.
 
-Thresholds/windows are read from classifier.py's named constants -- not
-duplicated here.
+Thresholds / the default window seed are read from classifier.py's named
+constants -- not duplicated here.
 """
 from __future__ import annotations
 
@@ -33,8 +40,8 @@ import traceback
 from datetime import datetime, timezone
 
 import numpy as np
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtCore import Qt, QPointF, QRect, QRectF, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QDialog, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
@@ -101,9 +108,12 @@ def _auto_cache_current(stored, fresh) -> bool:
     """True if the stored auto_classification cache still matches a freshly
     computed one -- so the sync pass can skip an idempotent no-op write.
 
-    A change in the PROVISIONAL thresholds snapshot, the hard label, the
-    borderline flag, or either ratio (to 6 dp) marks the cache STALE so it is
-    rewritten. Everything else is derived from these, so this is sufficient.
+    A change in the PROVISIONAL thresholds snapshot, the WINDOW the record was
+    classified under, the hard label, the borderline flag, or either evolution
+    ratio (to 6 dp) marks the cache STALE so it is rewritten. The window is
+    included because auto_classification is a cache of BOTH the constants and the
+    window used -- a manual_window edit must invalidate it even if the label is
+    unchanged. Everything else is derived from these, so this is sufficient.
     """
     if not isinstance(stored, dict):
         return False
@@ -111,18 +121,138 @@ def _auto_cache_current(stored, fresh) -> bool:
         return False
     if stored.get("label") != fresh.get("label"):
         return False
+    if stored.get("window_source") != fresh.get("window_source"):
+        return False
+    sw = stored.get("window_used") or [None, None]
+    fw = fresh.get("window_used") or [None, None]
+    if [_round6(x) for x in sw] != [_round6(x) for x in fw]:
+        return False
     if bool(stored.get("borderline")) != bool(fresh.get("borderline")):
         return False
-    for k in ("couplet_ratio", "uv_ratio"):
+    for k in ("uv_two_peak_ratio", "lobe_ratio"):
         if _round6(stored.get(k)) != _round6(fresh.get(k)):
             return False
     return True
 
 
+class RangeSlider(QWidget):
+    """Minimal native dual-handle range slider over a float [minimum, maximum]
+    span (data units = nm). Self-contained -- no third-party dependency.
+
+    Emits `sliderMoved(low, high)` CONTINUOUSLY while a handle is dragged (live
+    visual feedback) and `rangeChanged(low, high)` ONCE on release (the commit
+    point). The two handles cannot cross; values are clamped to the bounds.
+    """
+
+    sliderMoved = pyqtSignal(float, float)
+    rangeChanged = pyqtSignal(float, float)
+
+    def __init__(self, minimum=0.0, maximum=1.0, parent=None):
+        super().__init__(parent)
+        self._min = float(minimum)
+        self._max = float(maximum)
+        self._low = self._min
+        self._high = self._max
+        self._radius = 8                 # handle radius (px)
+        self._active = None              # 'low' | 'high' | None
+        self.setMinimumHeight(34)
+        self.setMinimumWidth(140)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+
+    # ---- public API ----
+    def setBounds(self, minimum, maximum):
+        self._min, self._max = float(minimum), float(maximum)
+        if self._max <= self._min:
+            self._max = self._min + 1.0
+        self._low = min(max(self._low, self._min), self._max)
+        self._high = min(max(self._high, self._low), self._max)
+        self.update()
+
+    def setValues(self, low, high):
+        lo, hi = float(low), float(high)
+        if hi < lo:
+            lo, hi = hi, lo
+        self._low = min(max(lo, self._min), self._max)
+        self._high = min(max(hi, self._low), self._max)
+        self.update()
+
+    def values(self) -> tuple:
+        return (self._low, self._high)
+
+    # ---- geometry ----
+    def _track(self) -> QRect:
+        m = self._radius + 2
+        return QRect(m, self.height() // 2 - 3,
+                     max(1, self.width() - 2 * m), 6)
+
+    def _val_to_x(self, v: float) -> float:
+        tr = self._track()
+        span = self._max - self._min
+        frac = (v - self._min) / span if span else 0.0
+        return tr.left() + frac * tr.width()
+
+    def _x_to_val(self, x: float) -> float:
+        tr = self._track()
+        frac = (x - tr.left()) / tr.width() if tr.width() else 0.0
+        frac = min(max(frac, 0.0), 1.0)
+        return self._min + frac * (self._max - self._min)
+
+    # ---- painting ----
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        tr = self._track()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#cfd6dd"))                 # groove
+        p.drawRoundedRect(tr, 3, 3)
+        xlo, xhi = self._val_to_x(self._low), self._val_to_x(self._high)
+        p.setBrush(QColor("#ffd24d"))                 # selected span
+        p.drawRoundedRect(QRectF(xlo, float(tr.top()),
+                                 max(0.0, xhi - xlo), float(tr.height())), 3, 3)
+        cy = self.height() / 2.0
+        for x, on in ((xlo, self._active == "low"), (xhi, self._active == "high")):
+            p.setBrush(QColor("#f0a500") if on else QColor("#ffffff"))
+            p.setPen(QPen(QColor("#7a5c00"), 1.5))
+            p.drawEllipse(QPointF(x, cy), self._radius, self._radius)
+        p.end()
+
+    # ---- interaction ----
+    def _nearest_handle(self, x: float) -> str:
+        xlo, xhi = self._val_to_x(self._low), self._val_to_x(self._high)
+        if xlo == xhi:                                # overlapped -> pick by side
+            return "low" if x < xlo else "high"
+        return "low" if abs(x - xlo) <= abs(x - xhi) else "high"
+
+    def _drag_to(self, x: float):
+        v = self._x_to_val(x)
+        if self._active == "low":
+            self._low = min(v, self._high)
+        elif self._active == "high":
+            self._high = max(v, self._low)
+        self.update()
+        self.sliderMoved.emit(self._low, self._high)
+
+    def mousePressEvent(self, ev):
+        self._active = self._nearest_handle(ev.position().x())
+        self._drag_to(ev.position().x())
+
+    def mouseMoveEvent(self, ev):
+        if self._active is not None:
+            self._drag_to(ev.position().x())
+
+    def mouseReleaseEvent(self, _ev):
+        if self._active is None:
+            return
+        self._active = None
+        self.update()
+        self.rangeChanged.emit(self._low, self._high)
+
+
 class CDReviewWindow(QDialog):
     """Non-modal two-column ladder/staircase review over the verified cloud
     records. Reads + classifies on the main thread; the only cloud writes are
-    the two additive classification fields."""
+    the additive classification fields and the per-record manual_window."""
 
     def __init__(self, log=print, parent=None):
         super().__init__(parent)
@@ -206,9 +336,9 @@ class CDReviewWindow(QDialog):
 
         legend = QLabel(
             "Tints: ladder=green, staircase=blue, flagged=gray · "
-            "⚠ peach = borderline (±%.2f of a threshold) · "
+            "⚠ peach = borderline (±%.2f of the UV/lobe ratio threshold) · "
             "pink = human override disagrees with auto."
-            % classifier.BORDERLINE_DELTA)
+            % classifier.BORDERLINE_BAND)
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#555;font-size:11px;")
         left_v.addWidget(legend)
@@ -291,6 +421,39 @@ class CDReviewWindow(QDialog):
         dsplit.setStretchFactor(1, 2)
         v.addWidget(dsplit, stretch=1)
 
+        # ---- CD analysis-window slider (manual per-record override) ----
+        win_box = QGroupBox("CD analysis window  (drag handles; release to "
+                            "apply + reclassify + save)")
+        wv = QVBoxLayout(win_box)
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("min"))
+        self.win_min_lbl = QLabel("—")
+        self.win_min_lbl.setMinimumWidth(58)
+        self.win_min_lbl.setStyleSheet("font-weight:bold;")
+        srow.addWidget(self.win_min_lbl)
+        self.window_slider = RangeSlider(_PLOT_X_RANGE[0], _PLOT_X_RANGE[1])
+        self.window_slider.sliderMoved.connect(self._on_window_dragged)
+        self.window_slider.rangeChanged.connect(self._on_window_committed)
+        srow.addWidget(self.window_slider, stretch=1)
+        self.win_max_lbl = QLabel("—")
+        self.win_max_lbl.setMinimumWidth(58)
+        self.win_max_lbl.setStyleSheet("font-weight:bold;")
+        srow.addWidget(QLabel("max"))
+        srow.addWidget(self.win_max_lbl)
+        self.reset_window_btn = QPushButton("Reset to auto")
+        self.reset_window_btn.setToolTip(
+            "Clear this record's manual window and revert to the data-driven "
+            "window (re-saves the refreshed auto cache).")
+        self.reset_window_btn.clicked.connect(self._on_reset_window)
+        srow.addWidget(self.reset_window_btn)
+        wv.addLayout(srow)
+        self.window_status = QLabel("")
+        self.window_status.setTextFormat(Qt.TextFormat.RichText)
+        self.window_status.setWordWrap(True)
+        self.window_status.setStyleSheet("color:#555;font-size:11px;")
+        wv.addWidget(self.window_status)
+        v.addWidget(win_box)
+
         # manual reclassify controls
         rc = QGroupBox("Manual reclassify (override — kept beside the auto label)")
         rc_h = QHBoxLayout(rc)
@@ -366,10 +529,10 @@ class CDReviewWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, idx)
             item.setBackground(QBrush(self._item_brush(rec, res)))
             item.setToolTip(rec.get("filename") or rec.get("record_id") or "")
-            if res.label == "ladder":
+            if classifier.is_ladder(res.label):
                 self.ladder_list.addItem(item)
                 n_ladder += 1
-            elif res.label == "staircase":
+            elif res.label == classifier.LABEL_STAIRCASE:
                 self.staircase_list.addItem(item)
                 n_stair += 1
             else:
@@ -393,13 +556,22 @@ class CDReviewWindow(QDialog):
         rid = rec.get("record_id") or ""
         short = rid.split("-")[0] if rid else "(no id)"
         badges = []
+        # Handedness badge so S vs R is visible inside the shared LADDER column.
+        if classifier.is_ladder(res.label) and res.ladder_type:
+            badges.append(f"{res.ladder_type}-ladder")
         if res.borderline:
             badges.append("⚠borderline")
+        # Mark records running on a hand-set window vs. the default.
+        if classifier._resolve_manual_window(rec.get("manual_window")) is not None:
+            badges.append("✎win")
         h = _human_label(rec)
         if h:
+            # Human override is a coarse family (ladder/staircase/unsure); compare
+            # it against the auto label's family so 'ladder' agrees with either
+            # handedness.
             if h == "unsure":
                 badges.append("H:unsure?")
-            elif h != res.label:
+            elif h != classifier.label_family(res.label):
                 badges.append(f"H:{h}✗")
             else:
                 badges.append(f"H:{h}✓")
@@ -408,12 +580,13 @@ class CDReviewWindow(QDialog):
 
     def _item_brush(self, rec: dict, res) -> QColor:
         h = _human_label(rec)
-        if h and h != "unsure" and h != res.label:
+        if h and h != "unsure" and h != classifier.label_family(res.label):
             return _DISAGREE_TINT
         if res.borderline:
             return _BORDERLINE_TINT
         return {"ladder": _LADDER_TINT,
-                "staircase": _STAIRCASE_TINT}.get(res.label, _FLAGGED_TINT)
+                "staircase": _STAIRCASE_TINT}.get(
+                    classifier.label_family(res.label), _FLAGGED_TINT)
 
     def _on_item_clicked(self, item: QListWidgetItem):
         idx = item.data(Qt.ItemDataRole.UserRole)
@@ -445,6 +618,10 @@ class CDReviewWindow(QDialog):
             "unconfigured/unreachable, or empty — see the log.")
         self.metrics_label.setText("")
         self.disagree_banner.setVisible(False)
+        self.window_status.setText("")
+        self.win_min_lbl.setText("—")
+        self.win_max_lbl.setText("—")
+        self._win_patches = []
         for ax in self._axes.values():
             ax.clear()
         self._draw_axes_chrome()
@@ -463,56 +640,82 @@ class CDReviewWindow(QDialog):
             f"<code>{rid}</code>"
             + (f" &nbsp;|&nbsp; {fname}" if fname else ""))
         self.metrics_label.setText(self._metrics_html(rec, res))
+        self._seed_window_slider(rec)
         self._draw_detail_plots(idx)
         self._set_detail_enabled(True)
         self._set_human_radios(_human_label(rec))
         self._refresh_override_banner(rec, res)
+        self._update_window_status(rec, res)
         self._select_index_in_columns(idx)
 
     def _metrics_html(self, rec: dict, res) -> str:
-        c1, c2 = res.criterion1, res.criterion2
-        cdlo, cdhi = classifier.CD_WINDOW_NM
-        uvlo, uvhi = classifier.UV_WINDOW_NM
-        t1 = classifier.CRIT1_RATIO_THRESHOLD
-        t2 = classifier.CRIT2_RATIO_THRESHOLD
+        g = res.gates
+        psmin, psmax = (classifier.UV_PEAK_SEARCH_MIN,
+                        classifier.UV_PEAK_SEARCH_MAX)
+        t_uv = classifier.UV_RATIO_THRESHOLD
+        t_lobe = classifier.LOBE_RATIO_THRESHOLD
 
-        def chip(ok):
+        def chip(ok, pass_text="PASS", fail_text="FAIL"):
             color = "#28a745" if ok else "#c82333"
             return (f"<span style='color:white;background:{color};"
                     f"padding:1px 6px;border-radius:3px;'>"
-                    f"{'PASS' if ok else 'FAIL'}</span>")
+                    f"{pass_text if ok else fail_text}</span>")
 
+        # Label + handedness + borderline.
+        hand = (f" &nbsp;<span style='color:#555;'>(handedness "
+                f"<b>{res.ladder_type}</b>)</span>" if res.ladder_type else "")
         bl = ""
         if res.borderline:
             bl = (" &nbsp;<span style='background:#ffe5b4;padding:1px 5px;"
                   "border-radius:3px;'>BORDERLINE: "
-                  f"{', '.join(res.borderline_criteria)}</span>")
+                  f"{', '.join(res.borderline_flags)}</span>")
 
-        if c2.single_peak:
-            c2_metric = "single UV peak (no peak2) → criterion fails"
+        win = (f"[{_wl(res.window_left)} … {_wl(res.window_right)}]"
+               if res.window_left is not None else "—")
+        if res.window_source == "manual":
+            win_src = ("<span style='color:#7a5c00;font-weight:bold;'>"
+                       "manual</span>")
+        elif res.window_source == "data-driven":
+            win_src = "auto (data-driven)"
         else:
-            c2_metric = (f"peak2/peak1 = <b>{_f(c2.ratio, 2)}</b> "
-                         f"(threshold ≥ {t2})")
+            win_src = "—"
 
-        reasons = "; ".join(res.reasons) if res.reasons else "—"
+        uv_ratio_metric = (f"peak2/peak1 (baseline-subtracted) = "
+                           f"<b>{_f(res.uv_two_peak_ratio, 2)}</b> "
+                           f"(threshold ≥ {t_uv})")
+        lobe_metric = (f"min/max lobe = <b>{_f(res.lobe_ratio, 2)}</b> "
+                       f"(threshold ≥ {t_lobe})")
+
+        reason = res.audit_reason or "—"
 
         return f"""
         <div style='font-size:13px;'>
         <h3 style='margin:2px 0;'>Auto label:
-          <span style='text-transform:uppercase;'>{res.label}</span>{bl}</h3>
+          <span style='text-transform:uppercase;'>{res.label}</span>{hand}{bl}</h3>
+        <div style='color:#444;'>bisignate couplet:
+          <b>{'yes' if res.bisignate else 'no'}</b></div>
         <hr>
-        <b>Criterion 1 — CD couplet ({cdlo:.0f}–{cdhi:.0f} nm)</b> &nbsp;{chip(c1.passed)}<br>
-        &nbsp;&nbsp;positive peak: <b>{_f(c1.pos_peak_value)}</b> @ {_wl(c1.pos_peak_wl)}<br>
-        &nbsp;&nbsp;negative peak: <b>{_f(c1.neg_peak_value)}</b> @ {_wl(c1.neg_peak_wl)}<br>
-        &nbsp;&nbsp;opposite signs (bisignate couplet): <b>{'yes' if c1.opposite_signs else 'no'}</b><br>
-        &nbsp;&nbsp;|pos|/|neg| = <b>{_f(c1.couplet_ratio, 2)}</b> (threshold ≥ {t1})<br>
+        <b>UV bands ({psmin:.0f}–{psmax:.0f} nm search)</b>
+          &nbsp;{chip(g.uv_band_detected, "2 BANDS", "1 BAND")}<br>
+        &nbsp;&nbsp;baseline (tail): <b>{_f(res.uv_baseline)}</b><br>
+        &nbsp;&nbsp;peak1 (shorter λ): <b>{_f(res.uv_peak1.value)}</b> @ {_wl(res.uv_peak1.wl)}<br>
+        &nbsp;&nbsp;peak2 (longer λ): <b>{_f(res.uv_peak2.value)}</b> @ {_wl(res.uv_peak2.wl)}<br>
+        &nbsp;&nbsp;inter-band valley: {_wl(res.interband_valley_lambda)}<br>
+        &nbsp;&nbsp;CD window used ({win_src}): <b>{win}</b><br>
         <br>
-        <b>Criterion 2 — UV two-peak ({uvlo:.0f}–{uvhi:.0f} nm)</b> &nbsp;{chip(c2.passed)}<br>
-        &nbsp;&nbsp;peak1 (shorter λ): <b>{_f(c2.peak1_value)}</b> @ {_wl(c2.peak1_wl)}<br>
-        &nbsp;&nbsp;peak2 (longer λ): <b>{_f(c2.peak2_value)}</b> @ {_wl(c2.peak2_wl)}<br>
-        &nbsp;&nbsp;{c2_metric}<br>
+        <b>Evolution gate — UV</b> &nbsp;{chip(g.uv_ratio_pass)}<br>
+        &nbsp;&nbsp;{uv_ratio_metric}<br>
         <br>
-        <b>reason notes:</b> {reasons}
+        <b>CD couplet (inside window)</b>
+          &nbsp;{chip(g.cd_couplet, "COUPLET", "NONE")}<br>
+        &nbsp;&nbsp;positive lobe: <b>{_f(res.cd_pos_lobe.value)}</b> @ {_wl(res.cd_pos_lobe.wl)}<br>
+        &nbsp;&nbsp;negative lobe: <b>{_f(res.cd_neg_lobe.value)}</b> @ {_wl(res.cd_neg_lobe.wl)}<br>
+        &nbsp;&nbsp;crossover (interp): <b>{_wl(res.crossover_wavelength)}</b><br>
+        <br>
+        <b>Evolution gate — CD lobes</b> &nbsp;{chip(g.lobe_ratio_pass)}<br>
+        &nbsp;&nbsp;{lobe_metric}<br>
+        <hr>
+        <b>audit reason:</b> {reason}
         </div>
         """
 
@@ -539,8 +742,27 @@ class CDReviewWindow(QDialog):
             ax.set_title(_SIGNAL_TITLES[sig], fontsize=10)
             ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
 
+    def _draw_window_box(self, lo, hi):
+        """Shade the analysis window on BOTH the CD and UV axes (the CD couplet
+        is read inside it). Tracks the patches so a live slider drag can move
+        the box cheaply without replotting the curves. Pass None/None to clear.
+        The CD and UV axes share one x-range (sharex), so the box is vertically
+        aligned across both plots."""
+        for patch in getattr(self, "_win_patches", []):
+            try:
+                patch.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self._win_patches = []
+        if lo is not None and hi is not None and hi > lo:
+            for ax in (self.ax_cd, self.ax_uv):
+                self._win_patches.append(
+                    ax.axvspan(lo, hi, color="#ffd24d", alpha=0.15, zorder=0))
+        self.canvas.draw_idle()
+
     def _draw_detail_plots(self, idx: int):
         rec, res = self.records[idx], self.results[idx]
+        self._win_patches = []        # cleared with the axes below
         for ax in self._axes.values():
             ax.clear()
 
@@ -551,29 +773,44 @@ class CDReviewWindow(QDialog):
                 wl, y = arr
                 ax.plot(wl, y, color=_SIGNAL_COLORS[sig], linewidth=1.3)
 
-        # --- CD: shade couplet window + mark selected pos/neg peaks ---
-        c1 = res.criterion1
-        cdlo, cdhi = classifier.CD_WINDOW_NM
-        self.ax_cd.axvspan(cdlo, cdhi, color="#ffd24d", alpha=0.13, zorder=0)
-        if c1.pos_peak_wl is not None and c1.pos_peak_value is not None:
-            self._mark(self.ax_cd, c1.pos_peak_wl, c1.pos_peak_value, "^",
-                       "#d62728", f"pos {c1.pos_peak_wl:.0f}nm")
-        if c1.neg_peak_wl is not None and c1.neg_peak_value is not None:
-            self._mark(self.ax_cd, c1.neg_peak_wl, c1.neg_peak_value, "v",
-                       "#1f77b4", f"neg {c1.neg_peak_wl:.0f}nm", below=True)
+        # --- analysis window: shade on BOTH CD and UV at the ACTUAL window the
+        # classifier used (res.window). A live slider drag re-draws this box at
+        # the candidate window via _draw_window_box; on release the record is
+        # reclassified so res.window == the committed manual window. None for
+        # flagged / single-band records (nothing to shade).
+        self._draw_window_box(res.window_left, res.window_right)
 
-        # --- UV: shade window + mark peak1/peak2 (or single-peak note) ---
-        c2 = res.criterion2
-        uvlo, uvhi = classifier.UV_WINDOW_NM
-        self.ax_uv.axvspan(uvlo, uvhi, color="#ffd24d", alpha=0.13, zorder=0)
-        if c2.peak1_wl is not None and c2.peak1_value is not None:
-            lbl = ("single UV peak" if c2.single_peak
-                   else f"peak1 {c2.peak1_wl:.0f}nm")
-            self._mark(self.ax_uv, c2.peak1_wl, c2.peak1_value, "o",
-                       "#d62728", lbl)
-        if c2.peak2_wl is not None and c2.peak2_value is not None:
-            self._mark(self.ax_uv, c2.peak2_wl, c2.peak2_value, "s",
-                       "#9467bd", f"peak2 {c2.peak2_wl:.0f}nm")
+        # --- CD: mark the two lobes + the zero-crossing (crossover) ---
+        pos, neg = res.cd_pos_lobe, res.cd_neg_lobe
+        if pos.wl is not None and pos.value is not None:
+            self._mark(self.ax_cd, pos.wl, pos.value, "^",
+                       "#d62728", f"+lobe {pos.wl:.0f}nm")
+        if neg.wl is not None and neg.value is not None:
+            self._mark(self.ax_cd, neg.wl, neg.value, "v",
+                       "#1f77b4", f"-lobe {neg.wl:.0f}nm", below=True)
+        if res.crossover_wavelength is not None:
+            self.ax_cd.axvline(res.crossover_wavelength, color="#6f42c1",
+                               linestyle="--", linewidth=1.1, zorder=5)
+            self.ax_cd.annotate(
+                f"x0 {res.crossover_wavelength:.0f}nm",
+                (res.crossover_wavelength, 0.0), textcoords="offset points",
+                xytext=(4, 4), fontsize=8, color="#6f42c1", zorder=7)
+
+        # --- UV: draw the baseline, mark peak1/peak2, and the inter-band
+        # valley (the window's left edge). ---
+        if res.uv_baseline is not None:
+            self.ax_uv.axhline(res.uv_baseline, color="#999999",
+                               linestyle=":", linewidth=1.0, zorder=1)
+        p1, p2 = res.uv_peak1, res.uv_peak2
+        if p1.wl is not None and p1.value is not None:
+            self._mark(self.ax_uv, p1.wl, p1.value, "o",
+                       "#d62728", f"peak1 {p1.wl:.0f}nm")
+        if p2.wl is not None and p2.value is not None:
+            self._mark(self.ax_uv, p2.wl, p2.value, "s",
+                       "#9467bd", f"peak2 {p2.wl:.0f}nm")
+        if res.interband_valley_lambda is not None:
+            self.ax_uv.axvline(res.interband_valley_lambda, color="#fd7e14",
+                               linestyle="--", linewidth=1.0, zorder=4)
 
         self._draw_axes_chrome()
         self.toolbar.update()      # reset zoom/pan history for the new record
@@ -586,12 +823,130 @@ class CDReviewWindow(QDialog):
             xytext=(4, -12 if below else 6), fontsize=8, color=color,
             zorder=7)
 
+    # --------------------------------------------- analysis-window slider ----
+    def _seed_window_slider(self, rec: dict):
+        """Initialize the slider to the record's stored manual_window if present,
+        else the global default (classifier.WINDOW_DEFAULT_*). blockSignals so
+        seeding never triggers a spurious commit/reclassify."""
+        self.window_slider.blockSignals(True)
+        self.window_slider.setBounds(_PLOT_X_RANGE[0], _PLOT_X_RANGE[1])
+        mw = classifier._resolve_manual_window(rec.get("manual_window"))
+        if mw is not None:
+            lo, hi = mw
+        else:
+            lo = classifier.WINDOW_DEFAULT_MIN
+            hi = classifier.WINDOW_DEFAULT_MAX
+        self.window_slider.setValues(lo, hi)
+        self.window_slider.blockSignals(False)
+        self.win_min_lbl.setText(f"{lo:.0f} nm")
+        self.win_max_lbl.setText(f"{hi:.0f} nm")
+
+    def _update_window_status(self, rec: dict, res):
+        mw = classifier._resolve_manual_window(rec.get("manual_window"))
+        if mw is not None:
+            self.window_status.setText(
+                f"<b>Manual window ACTIVE</b> — {mw[0]:.0f}–{mw[1]:.0f} nm "
+                f"overrides the auto window. Drag to adjust, or "
+                f"<i>Reset to auto</i>.")
+        elif res.window_left is not None:
+            self.window_status.setText(
+                f"No manual window — classifier uses the <b>auto "
+                f"(data-driven)</b> window "
+                f"{res.window_left:.0f}–{res.window_right:.0f} nm. Slider shows "
+                f"the default "
+                f"{classifier.WINDOW_DEFAULT_MIN:.0f}–"
+                f"{classifier.WINDOW_DEFAULT_MAX:.0f} nm; drag + release to set "
+                f"a manual window for this record.")
+        else:
+            self.window_status.setText(
+                "No manual window. The auto window is unavailable for this "
+                "record (flagged / single UV band). Drag + release to force a "
+                "manual CD window.")
+
+    def _on_window_dragged(self, lo: float, hi: float):
+        """Live during a handle drag: update the nm readouts and redraw the
+        shaded box only. Reclassification is DEFERRED to release."""
+        self.win_min_lbl.setText(f"{lo:.0f} nm")
+        self.win_max_lbl.setText(f"{hi:.0f} nm")
+        self._draw_window_box(lo, hi)
+
+    def _on_window_committed(self, lo: float, hi: float):
+        """On handle RELEASE: set this record's manual_window, reclassify under
+        it, persist BOTH the window and the refreshed auto cache together, and
+        refresh the metrics + markers + columns."""
+        if not (0 <= self.current_index < len(self.records)):
+            return
+        idx = self.current_index
+        rec = self.records[idx]
+        mw = {"min_nm": round(float(lo), 1), "max_nm": round(float(hi), 1)}
+        rec["manual_window"] = mw                       # mirror locally
+        res = classifier.classify_record(rec)           # recompute under window
+        self.results[idx] = res
+        auto = classifier.auto_classification_doc(res)
+        rec["auto_classification"] = auto               # mirror locally
+        self.win_min_lbl.setText(f"{lo:.0f} nm")
+        self.win_max_lbl.setText(f"{hi:.0f} nm")
+        self.metrics_label.setText(self._metrics_html(rec, res))
+        self._draw_detail_plots(idx)
+        self._update_window_status(rec, res)
+        self._populate_columns()
+        self._select_index_in_columns(idx)
+        self._persist_window(rec.get("record_id"), mw, auto)
+
+    def _on_reset_window(self):
+        """Clear this record's manual_window (revert to the data-driven window),
+        reclassify, and persist the cleared field + refreshed cache together."""
+        if not (0 <= self.current_index < len(self.records)):
+            return
+        idx = self.current_index
+        rec = self.records[idx]
+        rec.pop("manual_window", None)                  # mirror clear locally
+        res = classifier.classify_record(rec)           # data-driven again
+        self.results[idx] = res
+        auto = classifier.auto_classification_doc(res)
+        rec["auto_classification"] = auto
+        self._seed_window_slider(rec)                   # back to default seed
+        self.metrics_label.setText(self._metrics_html(rec, res))
+        self._draw_detail_plots(idx)
+        self._update_window_status(rec, res)
+        self._populate_columns()
+        self._select_index_in_columns(idx)
+        self._persist_window(rec.get("record_id"), None, auto)
+
+    def _persist_window(self, rid, manual_window, auto):
+        """Atomically write manual_window (or clear it) + the refreshed auto
+        cache via mongo_db.set_manual_window. Guarded + non-blocking-ish like the
+        override save; a failure is surfaced in the window status line."""
+        if not rid:
+            self._log("Manual window not persisted: record has no record_id.")
+            self.window_status.setText(
+                "⚠ Not saved to cloud: this record has no record_id.")
+            return
+        self.window_slider.setEnabled(False)
+        self.reset_window_btn.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            from mongo_db import set_manual_window
+            res = set_manual_window(rid, manual_window, auto, log=self._log)
+        except Exception as e:
+            self._log(f"Manual window save failed: {type(e).__name__}: {e}")
+            self._log(traceback.format_exc())
+            res = {"ok": False, "message": str(e)}
+        finally:
+            self.window_slider.setEnabled(True)
+            self.reset_window_btn.setEnabled(True)
+        if not res.get("ok"):
+            self.window_status.setText(
+                "⚠ Cloud save failed: " + res.get("message", "unknown error"))
+
     # ------------------------------------------------- manual reclassify ----
     def _set_detail_enabled(self, enabled: bool):
         for btn in self._human_btns.values():
             btn.setEnabled(enabled)
         self.save_override_btn.setEnabled(enabled)
         self.clear_override_btn.setEnabled(enabled)
+        self.window_slider.setEnabled(enabled)
+        self.reset_window_btn.setEnabled(enabled)
 
     def _set_human_radios(self, label):
         # Allow "none checked" by toggling exclusivity around the change.
@@ -658,7 +1013,7 @@ class CDReviewWindow(QDialog):
         if h == "unsure":
             self._banner("#fff3cd", "#856404",
                          "Human marked <b>UNSURE</b> — flagged for a second look.")
-        elif h != res.label:
+        elif h != classifier.label_family(res.label):
             self._banner(
                 "#f8d7da", "#721c24",
                 f"Human override <b>{h.upper()}</b> DISAGREES with auto "
