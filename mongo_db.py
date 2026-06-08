@@ -690,26 +690,32 @@ def replace_by_id(existing_id: str, record: dict, log=print) -> dict:
 # ===========================================================================
 # The CD-shape review window (Phase B) writes two ADDITIVE fields back onto each
 # cloud doc, addressed by record_id:
-#   - auto_classification : a REFRESHABLE CACHE of the classifier's output
-#     (label + borderline + key metrics + the thresholds snapshot). Re-synced
-#     whenever classifier.py's PROVISIONAL thresholds change; the pass is
-#     idempotent and re-runnable.
-#   - human_classification: the DURABLE reviewer override (Ladder/Staircase/
-#     Unsure + timestamp), independent of threshold changes.
-# Both are pure $set of a single field -- the spectral arrays and every other
-# field are left exactly as-is. Neither function ever raises; failures are
-# logged and reported in the return value so the GUI never crashes on a cloud
-# hiccup. record_id is the key per the persistence contract; one cloud doc per
+#   - computed_metrics    : a REFRESHABLE CACHE of the classifier's OBJECTIVE
+#     metrics (UV/CD peaks + both ratios + gate booleans + borderline + the
+#     thresholds snapshot). NO verdict. Re-synced whenever classifier.py's
+#     PROVISIONAL thresholds or a record's manual_window change; the pass is
+#     idempotent and re-runnable. (Renamed from the legacy `auto_classification`
+#     block, which carried an auto label/ladder_type -- the metrics writers
+#     $unset that old field so docs migrate on the next write.)
+#   - human_classification: the DURABLE reviewer category (Ladder/Staircase/
+#     Unsure + timestamp) -- now the ONLY category label and the single source
+#     of truth for sorting and stats. Set on save, $unset on clear.
+# Both are pure single-field updates -- the spectral arrays and every other field
+# are left exactly as-is. Neither function ever raises; failures are logged and
+# reported in the return value so the GUI never crashes on a cloud hiccup.
+# record_id is the key per the persistence contract; one cloud doc per
 # filename_key means it addresses a single document.
 
 
-def sync_auto_classifications(updates, log=print) -> dict:
-    """Additively cache the classifier's auto labels onto cloud docs, keyed by
-    record_id. ONLY the `auto_classification` field is $set -- spectra and all
-    other fields are untouched. Idempotent and re-runnable: safe to call after
-    every classify pass (e.g. once classifier.py's thresholds change).
+def sync_computed_metrics(updates, log=print) -> dict:
+    """Additively cache the classifier's OBJECTIVE metrics onto cloud docs, keyed
+    by record_id. Each update $sets `computed_metrics` AND $unsets the legacy
+    `auto_classification` block (migration: a doc that still carries the old auto
+    label loses it on the next write). Spectra and all other fields are untouched.
+    Idempotent and re-runnable: safe to call after every measure pass (e.g. once
+    classifier.py's thresholds change).
 
-    `updates`: iterable of (record_id, auto_doc) pairs. A pair with a falsy
+    `updates`: iterable of (record_id, metrics_doc) pairs. A pair with a falsy
     record_id is skipped (a doc with no record_id can't be addressed this way).
 
     Returns {"matched": int, "modified": int, "skipped": int, "failed": int}.
@@ -720,20 +726,20 @@ def sync_auto_classifications(updates, log=print) -> dict:
 
     ops_in = list(updates)
     ops = []
-    for rid, auto in ops_in:
+    for rid, metrics in ops_in:
         if not rid:
             summary["skipped"] += 1
             continue
-        ops.append((rid, auto))
+        ops.append((rid, metrics))
 
     if not ops:
         if ops_in:
-            log(f"  auto-classification sync: {summary['skipped']} skipped "
+            log(f"  computed-metrics sync: {summary['skipped']} skipped "
                 f"(no record_id); nothing to write.")
         return summary
 
     if not config.mongo_configured():
-        log("MongoDB not configured -- cannot sync auto-classifications.")
+        log("MongoDB not configured -- cannot sync computed metrics.")
         summary["failed"] += len(ops)
         return summary
 
@@ -744,17 +750,18 @@ def sync_auto_classifications(updates, log=print) -> dict:
         collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
         client.admin.command("ping")
         bulk = [UpdateOne({"record_id": rid},
-                          {"$set": {"auto_classification": auto}})
-                for rid, auto in ops]
+                          {"$set": {"computed_metrics": metrics},
+                           "$unset": {"auto_classification": ""}})
+                for rid, metrics in ops]
         res = collection.bulk_write(bulk, ordered=False)
         summary["matched"] = res.matched_count
         summary["modified"] = res.modified_count
         tail = (f"; {summary['skipped']} skipped (no record_id)"
                 if summary["skipped"] else "")
-        log(f"  auto-classification sync: matched {res.matched_count}, "
+        log(f"  computed-metrics sync: matched {res.matched_count}, "
             f"modified {res.modified_count}{tail}.")
     except Exception as e:
-        log(f"Auto-classification sync failed: {type(e).__name__}: {e}")
+        log(f"Computed-metrics sync failed: {type(e).__name__}: {e}")
         summary["failed"] += len(ops)
     finally:
         if client is not None:
@@ -766,10 +773,14 @@ def sync_auto_classifications(updates, log=print) -> dict:
 
 
 def set_human_classification(record_id, human_doc, log=print) -> dict:
-    """Write the durable human override onto ONE cloud doc, keyed by record_id.
-    ONLY the `human_classification` field is $set -- the auto label and the
-    spectra are left intact. update_one without upsert: if no doc has this
-    record_id we report it, never create one.
+    """Set OR CLEAR the durable human category on ONE cloud doc, keyed by
+    record_id. human_classification (Ladder/Staircase/Unsure + timestamp) is now
+    the SINGLE source of truth for sorting and stats in Phase B.
+
+    `human_doc`: the category dict to $set, or None to CLEAR it ($unset) --
+    clearing returns the record to unreviewed/grey. ONLY this one field is
+    touched; computed_metrics, manual_window and the spectra are left intact.
+    update_one without upsert: a missing record_id is reported, never created.
 
     Returns {"ok": bool, "message": str}. Never raises.
     """
@@ -785,23 +796,30 @@ def set_human_classification(record_id, human_doc, log=print) -> dict:
         log(result["message"])
         return result
 
+    clearing = human_doc is None
+    update = ({"$unset": {"human_classification": ""}} if clearing
+              else {"$set": {"human_classification": human_doc}})
+
     client = None
     try:
         client = get_client()
         collection = client[config.MONGODB_DB][config.MONGODB_COLLECTION]
         client.admin.command("ping")
-        res = collection.update_one(
-            {"record_id": record_id},
-            {"$set": {"human_classification": human_doc}})
+        res = collection.update_one({"record_id": record_id}, update)
         if res.matched_count == 0:
+            verb = "not cleared" if clearing else "not saved"
             result["message"] = (f"No cloud record with record_id "
-                                 f"{record_id} -- override not saved.")
+                                 f"{record_id} -- classification {verb}.")
             log(result["message"])
             return result
         result["ok"] = True
-        result["message"] = (f"Saved human classification "
-                             f"'{human_doc.get('label')}' for record_id "
-                             f"{record_id}.")
+        if clearing:
+            result["message"] = (f"Cleared human classification for record_id "
+                                 f"{record_id}.")
+        else:
+            result["message"] = (f"Saved human classification "
+                                 f"'{human_doc.get('label')}' for record_id "
+                                 f"{record_id}.")
         log(result["message"])
         return result
     except Exception as e:
@@ -817,19 +835,22 @@ def set_human_classification(record_id, human_doc, log=print) -> dict:
                 pass
 
 
-def set_manual_window(record_id, manual_window, auto_doc, log=print) -> dict:
-    """Persist a per-record manual CD window AND its refreshed auto cache TOGETHER
-    on ONE cloud doc, keyed by record_id, in a single atomic update.
+def set_manual_window(record_id, manual_window, metrics_doc, log=print) -> dict:
+    """Persist a per-record manual CD window AND its refreshed metrics cache
+    TOGETHER on ONE cloud doc, keyed by record_id, in a single atomic update.
 
-    auto_classification is a cache derived from BOTH the provisional constants
-    AND the window used, so the two must never be written out of sync. The
-    caller recomputes the classification under the new window and hands us both:
+    computed_metrics is a cache derived from BOTH the provisional constants AND
+    the window used, so the two must never be written out of sync. The caller
+    re-measures under the new window and hands us both:
 
       - `manual_window`: a {"min_nm", "max_nm"} dict to SET, or None to CLEAR
         (revert the record to the data-driven window). Clearing $unsets the
         field so it disappears from the doc rather than lingering as null.
-      - `auto_doc`: the refreshed classifier.auto_classification_doc(result),
+      - `metrics_doc`: the refreshed classifier.computed_metrics_doc(result),
         always $set so the stored cache matches the window just chosen.
+
+    The legacy `auto_classification` block is always $unset here too, so a record
+    migrates to computed_metrics the next time its window is touched.
 
     update_one without upsert: a missing record_id is reported, never created.
     Returns {"ok": bool, "message": str}. Never raises.
@@ -846,10 +867,12 @@ def set_manual_window(record_id, manual_window, auto_doc, log=print) -> dict:
         log(result["message"])
         return result
 
-    # Build ONE update so manual_window and the cache land together.
-    update: dict = {"$set": {"auto_classification": auto_doc}}
+    # Build ONE update so manual_window and the cache land together. The legacy
+    # auto_classification block is $unset for migration.
+    update: dict = {"$set": {"computed_metrics": metrics_doc},
+                    "$unset": {"auto_classification": ""}}
     if manual_window is None:
-        update["$unset"] = {"manual_window": ""}
+        update["$unset"]["manual_window"] = ""
         action = "cleared (reverted to data-driven)"
     else:
         update["$set"]["manual_window"] = manual_window

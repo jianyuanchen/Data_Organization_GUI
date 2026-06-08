@@ -1,35 +1,44 @@
 """
-CD-shape REVIEW window -- Phase B visual audit / validation layer for the
-Phase A classifier (`classifier.py`).
+CD-shape REVIEW window -- Phase B worklist + human-classification layer over the
+Phase A MEASURER (`classifier.py`).
 
 A NEW, SEPARATE window from the read-only Cloud Browser (this module never
 imports or modifies `cloud_browser_window`). It reads the SAME source -- the
 verified CLOUD (MongoDB Atlas) records via `mongo_db.fetch_records` -- runs
-`classifier.classify_record` on each, and lays them out in two columns by hard
-label (LADDER | STAIRCASE) plus a small FLAGGED section for un-computable /
-bad-data records. Borderline records stay in their computed column with a clear
-visual marker rather than getting their own column.
+`classifier.classify_record` on each to compute OBJECTIVE METRICS (no verdict),
+and lays them out as:
+
+  * a permanent left-hand WORKLIST of EVERY record (entries never leave when
+    classified) with a done marker + an optional All / Done / Not-done filter;
+  * three HUMAN-ONLY category columns (LADDER | STAIRCASE | FLAGGED-unsure) that
+    fill ONLY from the reviewer's saved human_classification.
+
+A record with no human label appears only in the worklist, rendered GREY
+(unreviewed). Saving a Ladder/Staircase/Unsure category turns the whole strip
+GREEN and files it into the matching column; clearing the category returns it to
+grey/unreviewed. The classifier NEVER suggests a verdict -- the human decides
+from the metrics.
 
 Clicking an entry opens a single-record DETAIL view: three stacked,
 Origin-faithful matplotlib subplots (CD / g / UV, raw embedded arrays drawn as
-plain lines -- no smoothing) with the classifier's selected peaks marked and
-its search windows shaded, plus a metrics panel that makes the classifier's
-REASONING auditable.
+plain lines -- no smoothing) with the classifier's selected peaks marked and the
+analysis window shaded, plus a metrics panel (UV peak ratio / CD peak ratio) that
+makes the measurement auditable.
 
 WRITES (the only ones this window performs -- spectra are NEVER touched):
-  - auto_classification : refreshable cache of the classifier output, synced to
-    each cloud doc keyed by record_id. Idempotent; re-synced when stale (e.g.
-    after the PROVISIONAL thresholds in classifier.py change, OR when a record's
-    manual_window changes -- the cache records window_used and is invalidated by
-    a window edit).
+  - computed_metrics    : refreshable cache of the classifier's OBJECTIVE metrics
+    (no label), synced to each cloud doc keyed by record_id. Idempotent;
+    re-synced when stale (after the PROVISIONAL thresholds in classifier.py
+    change, OR when a record's manual_window changes). Writers also $unset the
+    legacy `auto_classification` block so old docs migrate.
   - manual_window       : per-record CD analysis window {min_nm, max_nm} set via
     the dual-handle range slider. Overrides the data-driven window. Persisted
-    TOGETHER with a freshly recomputed auto_classification (one atomic write via
-    mongo_db.set_manual_window) so the two never drift out of sync. "Reset to
-    auto" $unsets it and reverts the record to the data-driven window.
-  - human_classification: durable reviewer override (Ladder/Staircase/Unsure +
-    timestamp), written on demand. Never overwrites the auto label -- both are
-    kept side by side; disagreements are surfaced as the tuning signal.
+    TOGETHER with a freshly recomputed computed_metrics (one atomic write via
+    mongo_db.set_manual_window). "Reset to auto" $unsets it.
+  - human_classification: the reviewer's category (Ladder/Staircase/Unsure +
+    timestamp) -- the ONLY category label and the single source of truth for the
+    columns and the ladder-% stat. Saved on demand; CLEARED ($unset) on "Clear
+    saved".
 
 Thresholds / the default window seed are read from classifier.py's named
 constants -- not duplicated here.
@@ -43,10 +52,10 @@ import numpy as np
 from PyQt6.QtCore import Qt, QPointF, QRect, QRectF, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QDialog, QFrame,
+    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog,
     QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
-    QStyledItemDelegate, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import (
@@ -62,43 +71,13 @@ _SIGNAL_TITLES = {"CD": "CD (mdeg)", "g": "g-value", "UV": "UV-Vis (abs)"}
 _SIGNAL_COLORS = {"CD": "tab:blue", "g": "tab:green", "UV": "tab:red"}
 _PLOT_X_RANGE = (300, 700)
 
-# Row tints. Disagreement (human override differs from auto) wins over
-# borderline, which wins over the plain per-label tint -- so the most
-# tuning-relevant rows are the most visually prominent.
-_LADDER_TINT = QColor("#d4edda")      # light green
-_STAIRCASE_TINT = QColor("#e7f1fb")   # light blue
-_FLAGGED_TINT = QColor("#d3d3d3")     # gray
-_BORDERLINE_TINT = QColor("#ffe5b4")  # peach -- "eyeball this one"
-_DISAGREE_TINT = QColor("#f8d7da")    # pink/red -- human vs auto disagreement
-
-# CONFIRMED = a human_classification override is saved on the record. Drawn as a
-# solid SATURATED-green left-border by _ConfirmedBorderDelegate -- a STATE that
-# is independent of the row's background tint (label/borderline/disagreement),
-# and deliberately distinct from the light _LADDER_TINT so it never reads as
-# "this row is in the ladder column".
-_CONFIRMED_BORDER = QColor("#1e7e34")  # solid dark green
-_CONFIRMED_ROLE = Qt.ItemDataRole.UserRole + 1   # bool: human override saved
-
-
-class _ConfirmedBorderDelegate(QStyledItemDelegate):
-    """Paints a solid green left-border on any list entry flagged CONFIRMED
-    (record carries a saved human_classification), on top of the normal row
-    background. The border is a state marker that coexists with every tint --
-    e.g. a confirmed row whose human label disagrees with auto keeps its pink
-    background AND gets the green border."""
-
-    _WIDTH = 5   # px
-
-    def paint(self, painter, option, index):
-        super().paint(painter, option, index)
-        if index.data(_CONFIRMED_ROLE):
-            r = option.rect
-            painter.save()
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-            painter.fillRect(
-                QRect(r.left(), r.top(), self._WIDTH, r.height()),
-                _CONFIRMED_BORDER)
-            painter.restore()
+# Entry lifecycle tints. There is only ONE axis of state now -- reviewed or not.
+# GREY (the main-UI staging "not yet sorted" gray) = unreviewed / no human label;
+# whole-strip GREEN (the staging "confirmed" green) = a saved human_classification.
+# Borderline is shown as a text badge, not a background, so it stays legible on
+# either tint.
+_UNREVIEWED_GREY = QColor("#d3d3d3")   # staging-area gray -- "not yet sorted"
+_CLASSIFIED_GREEN = QColor("#d4edda")  # whole-strip green -- "classified / done"
 
 
 def _human_readable(rec: dict) -> str:
@@ -113,7 +92,8 @@ def _human_readable(rec: dict) -> str:
 
 
 def _human_label(rec: dict):
-    """The stored human override label ('ladder'/'staircase'/'unsure') or None."""
+    """The saved human category ('ladder'/'staircase'/'unsure') or None. This is
+    the ONLY category label -- the classifier emits none."""
     h = rec.get("human_classification")
     if isinstance(h, dict):
         lab = (h.get("label") or "").lower()
@@ -133,22 +113,19 @@ def _round6(x):
     return None if x is None else round(float(x), 6)
 
 
-def _auto_cache_current(stored, fresh) -> bool:
-    """True if the stored auto_classification cache still matches a freshly
-    computed one -- so the sync pass can skip an idempotent no-op write.
+def _metrics_cache_current(stored, fresh) -> bool:
+    """True if the stored computed_metrics cache still matches a freshly computed
+    one -- so the sync pass can skip an idempotent no-op write.
 
     A change in the PROVISIONAL thresholds snapshot, the WINDOW the record was
-    classified under, the hard label, the borderline flag, or either evolution
-    ratio (to 6 dp) marks the cache STALE so it is rewritten. The window is
-    included because auto_classification is a cache of BOTH the constants and the
-    window used -- a manual_window edit must invalidate it even if the label is
-    unchanged. Everything else is derived from these, so this is sufficient.
+    measured under, the borderline flag, or either ratio (to 6 dp) marks the cache
+    STALE so it is rewritten. The window is included because computed_metrics is a
+    cache of BOTH the constants and the window used -- a manual_window edit must
+    invalidate it. Everything else is derived from these, so this is sufficient.
     """
     if not isinstance(stored, dict):
         return False
     if stored.get("thresholds") != fresh.get("thresholds"):
-        return False
-    if stored.get("label") != fresh.get("label"):
         return False
     if stored.get("window_source") != fresh.get("window_source"):
         return False
@@ -279,21 +256,24 @@ class RangeSlider(QWidget):
 
 
 class CDReviewWindow(QDialog):
-    """Non-modal two-column ladder/staircase review over the verified cloud
-    records. Reads + classifies on the main thread; the only cloud writes are
-    the additive classification fields and the per-record manual_window."""
+    """Non-modal worklist + human-classification review over the verified cloud
+    records. Reads + MEASURES on the main thread; the only cloud writes are the
+    additive computed_metrics cache, the per-record manual_window, and the
+    human_classification category."""
 
     def __init__(self, log=print, parent=None):
         super().__init__(parent)
         self.setModal(False)
-        self.setWindowTitle("CD-Shape Review  (ladder vs staircase)")
-        self.resize(1360, 820)
+        self.setWindowTitle("CD-Shape Review  (worklist · human classification)")
+        self.resize(1480, 860)
 
         self._log = log
         self.records: list[dict] = []          # verified cloud records
         self.results: list = []                # ClassificationResult per record
         self.current_index: int = -1
-        # The three column lists, so click handlers can clear each other.
+        self._worklist_filter = "all"          # "all" | "done" | "notdone"
+        # All FOUR column lists (worklist + 3 category), so click handlers can
+        # clear each other's selection.
         self._lists: list[QListWidget] = []
 
         self._build_ui()
@@ -304,11 +284,12 @@ class CDReviewWindow(QDialog):
         root = QVBoxLayout(self)
 
         banner = QLabel(
-            "CD-shape review — verified cloud records classified by "
-            "classifier.py (PROVISIONAL thresholds). Auto labels are cached "
-            "back to the cloud; your Ladder/Staircase/Unsure override is saved "
-            "separately and never overwrites the auto label. Spectra are never "
-            "modified.")
+            "CD-shape review — the classifier MEASURES each verified cloud "
+            "record (UV/CD metrics, no verdict); YOU assign the category. The "
+            "worklist on the left lists every record and tracks what's done; "
+            "pick Ladder / Staircase / Unsure to sort a record and mark it "
+            "reviewed. Computed metrics are cached back to the cloud; spectra "
+            "are never modified.")
         banner.setWordWrap(True)
         banner.setStyleSheet(
             "background:#d1ecf1;color:#0c5460;padding:6px;border-radius:4px;")
@@ -322,41 +303,62 @@ class CDReviewWindow(QDialog):
         top.addStretch(1)
         self.refresh_btn = QPushButton("Refresh from cloud")
         self.refresh_btn.setToolTip(
-            "Re-fetch verified cloud records, re-classify, and sync any stale "
-            "auto labels.")
+            "Re-fetch verified cloud records, re-measure, and sync any stale "
+            "computed metrics.")
         self.refresh_btn.clicked.connect(lambda: self.refresh())
         top.addWidget(self.refresh_btn)
-        self.resync_btn = QPushButton("Re-sync ALL auto labels")
+        self.resync_btn = QPushButton("Re-sync ALL metrics")
         self.resync_btn.setToolTip(
-            "Force-write the auto_classification cache for every record "
+            "Force-write the computed_metrics cache for every record "
             "(use after changing the thresholds/windows in classifier.py).")
         self.resync_btn.clicked.connect(self._on_force_resync)
         top.addWidget(self.resync_btn)
         root.addLayout(top)
 
-        # Main splitter: [ two columns + flagged ]  |  [ detail ]
+        # Main splitter: [ worklist + category columns ]  |  [ detail ]
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # ---- left: columns ----
+        # ---- left: worklist + human-only columns ----
         left = QWidget()
         left_v = QVBoxLayout(left)
         cols = QHBoxLayout()
 
+        # column 0 (far left): WORKLIST -- a permanent roster of ALL records.
+        self.worklist_box = QGroupBox("WORKLIST — all records")
+        wlv = QVBoxLayout(self.worklist_box)
+        filt_row = QHBoxLayout()
+        filt_row.addWidget(QLabel("Show:"))
+        self.worklist_filter_combo = QComboBox()
+        self.worklist_filter_combo.addItems(
+            ["All", "Done only", "Not-done only"])
+        self.worklist_filter_combo.setToolTip(
+            "Filter the worklist by review state. 'Done' = has a saved human "
+            "classification (Ladder, Staircase, or Unsure).")
+        self.worklist_filter_combo.currentIndexChanged.connect(
+            self._on_worklist_filter_changed)
+        filt_row.addWidget(self.worklist_filter_combo)
+        filt_row.addStretch(1)
+        wlv.addLayout(filt_row)
+        self.worklist = QListWidget()
+        wlv.addWidget(self.worklist)
+        cols.addWidget(self.worklist_box, stretch=2)
+
+        # human-only category columns
         self.ladder_box = QGroupBox("LADDER")
         lv = QVBoxLayout(self.ladder_box)
         self.ladder_list = QListWidget()
         lv.addWidget(self.ladder_list)
-        cols.addWidget(self.ladder_box, stretch=1)
+        cols.addWidget(self.ladder_box, stretch=2)
 
         self.staircase_box = QGroupBox("STAIRCASE")
         sv = QVBoxLayout(self.staircase_box)
         self.staircase_list = QListWidget()
         sv.addWidget(self.staircase_list)
-        cols.addWidget(self.staircase_box, stretch=1)
+        cols.addWidget(self.staircase_box, stretch=2)
 
         left_v.addLayout(cols, stretch=1)
 
-        self.flagged_box = QGroupBox("FLAGGED / bad data")
+        self.flagged_box = QGroupBox("FLAGGED / unsure + bad data")
         fv = QVBoxLayout(self.flagged_box)
         self.flagged_list = QListWidget()
         self.flagged_list.setMaximumHeight(120)
@@ -364,20 +366,22 @@ class CDReviewWindow(QDialog):
         left_v.addWidget(self.flagged_box)
 
         legend = QLabel(
-            "Tints: ladder=green, staircase=blue, flagged=gray · "
-            "⚠ peach = borderline (±%.2f of the UV/lobe ratio threshold) · "
-            "pink = human override disagrees with auto · "
-            "green left-border = CONFIRMED (human override saved)."
+            "Worklist holds every record and never empties. "
+            "Grey = unreviewed (no human label) · whole-strip green = confirmed "
+            "(human classified) · ⚠ = borderline (a ratio within ±%.2f of the "
+            "UV or CD peak-ratio threshold). Category columns fill only from "
+            "your Ladder/Staircase/Unsure choice; the Flagged section also "
+            "holds un-computable 'bad data' records (tagged). "
+            "✓ = done · ✎ win = manual CD window."
             % classifier.BORDERLINE_BAND)
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#555;font-size:11px;")
         left_v.addWidget(legend)
 
-        self._confirmed_delegate = _ConfirmedBorderDelegate(self)
-        for lst in (self.ladder_list, self.staircase_list, self.flagged_list):
+        for lst in (self.worklist, self.ladder_list,
+                    self.staircase_list, self.flagged_list):
             lst.setSelectionMode(
                 QAbstractItemView.SelectionMode.SingleSelection)
-            lst.setItemDelegate(self._confirmed_delegate)
             lst.itemClicked.connect(self._on_item_clicked)
             self._lists.append(lst)
 
@@ -388,7 +392,7 @@ class CDReviewWindow(QDialog):
 
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
-        splitter.setSizes([560, 800])
+        splitter.setSizes([720, 740])
         splitter.setChildrenCollapsible(False)
         root.addWidget(splitter, stretch=1)
 
@@ -409,12 +413,12 @@ class CDReviewWindow(QDialog):
         self.detail_header.setWordWrap(True)
         v.addWidget(self.detail_header)
 
-        # Disagreement / override banner (hidden until a record with a human
-        # override is shown).
-        self.disagree_banner = QLabel("")
-        self.disagree_banner.setWordWrap(True)
-        self.disagree_banner.setVisible(False)
-        v.addWidget(self.disagree_banner)
+        # Review banner (hidden until a record with a saved human label is
+        # shown). States only the human's own decision -- no auto verdict.
+        self.review_banner = QLabel("")
+        self.review_banner.setWordWrap(True)
+        self.review_banner.setVisible(False)
+        v.addWidget(self.review_banner)
 
         dsplit = QSplitter(Qt.Orientation.Horizontal)
 
@@ -455,7 +459,7 @@ class CDReviewWindow(QDialog):
 
         # ---- CD analysis-window slider (manual per-record override) ----
         win_box = QGroupBox("CD analysis window  (drag handles; release to "
-                            "apply + reclassify + save)")
+                            "apply + re-measure + save)")
         wv = QVBoxLayout(win_box)
         srow = QHBoxLayout()
         srow.addWidget(QLabel("min"))
@@ -475,7 +479,7 @@ class CDReviewWindow(QDialog):
         self.reset_window_btn = QPushButton("Reset to auto")
         self.reset_window_btn.setToolTip(
             "Clear this record's manual window and revert to the data-driven "
-            "window (re-saves the refreshed auto cache).")
+            "window (re-saves the refreshed metrics cache).")
         self.reset_window_btn.clicked.connect(self._on_reset_window)
         srow.addWidget(self.reset_window_btn)
         wv.addLayout(srow)
@@ -486,26 +490,28 @@ class CDReviewWindow(QDialog):
         wv.addWidget(self.window_status)
         v.addWidget(win_box)
 
-        # manual reclassify controls
-        rc = QGroupBox("Manual reclassify (override — kept beside the auto label)")
+        # human classification controls -- the ONLY category label
+        rc = QGroupBox("Classify  (your decision — the only category label)")
         rc_h = QHBoxLayout(rc)
         rc_h.addWidget(QLabel("Human:"))
         self.human_group = QButtonGroup(self)
         self.human_group.setExclusive(True)
         self._human_btns = {}
-        for lab, text in (("ladder", "Ladder"), ("staircase", "Staircase"),
-                          ("unsure", "Unsure")):
+        for lab, text in ((classifier.HUMAN_LADDER, "Ladder"),
+                          (classifier.HUMAN_STAIRCASE, "Staircase"),
+                          (classifier.HUMAN_UNSURE, "Unsure")):
             btn = QRadioButton(text)
             self.human_group.addButton(btn)
             self._human_btns[lab] = btn
             rc_h.addWidget(btn)
-        self.save_override_btn = QPushButton("Save override")
+        self.save_override_btn = QPushButton("Save")
         self.save_override_btn.clicked.connect(self._save_override)
         rc_h.addWidget(self.save_override_btn)
-        self.clear_override_btn = QPushButton("Clear")
-        self.clear_override_btn.setToolTip("Unselect (does not delete a "
-                                           "previously saved override).")
-        self.clear_override_btn.clicked.connect(lambda: self._set_human_radios(None))
+        self.clear_override_btn = QPushButton("Clear saved")
+        self.clear_override_btn.setToolTip(
+            "Delete this record's saved classification and return it to "
+            "unreviewed (grey / not-done).")
+        self.clear_override_btn.clicked.connect(self._clear_override)
         rc_h.addWidget(self.clear_override_btn)
         rc_h.addStretch(1)
         self.override_status = QLabel("")
@@ -518,8 +524,8 @@ class CDReviewWindow(QDialog):
 
     # --------------------------------------------------------- data load ----
     def refresh(self, initial: bool = False):
-        """Re-fetch verified cloud records, classify, sync stale auto labels,
-        and rebuild the columns. Network runs on the main thread (quick +
+        """Re-fetch verified cloud records, measure, sync stale metrics, and
+        rebuild the worklist + columns. Network runs on the main thread (quick +
         guarded); processEvents keeps the UI responsive while it blocks."""
         self.pct_label.setText("Loading…")
         self.refresh_btn.setEnabled(False)
@@ -534,8 +540,8 @@ class CDReviewWindow(QDialog):
             self.refresh_btn.setEnabled(True)
 
         self._populate_columns()
-        # Self-healing cache: write only the missing/stale auto labels.
-        self._sync_auto(force=False)
+        # Self-healing cache: write only the missing/stale computed metrics.
+        self._sync_metrics(force=False)
 
         if self.records:
             self._load_detail(0)
@@ -553,83 +559,98 @@ class CDReviewWindow(QDialog):
 
     # ----------------------------------------------------------- columns ----
     def _populate_columns(self):
+        """Rebuild the worklist (ALL records, filtered) and the category columns.
+        Ladder/Staircase fill from human_classification only; the Flagged section
+        holds human=Unsure records AND un-computable 'bad data' records that have
+        no human label yet."""
         for lst in self._lists:
             lst.clear()
-        n_ladder = n_stair = n_flag = 0
+        show = self._worklist_filter
+        n_ladder = n_stair = n_unsure = n_baddata = n_reviewed = 0
         for idx, (rec, res) in enumerate(zip(self.records, self.results)):
-            item = QListWidgetItem(self._item_text(rec, res))
-            item.setData(Qt.ItemDataRole.UserRole, idx)
-            item.setBackground(QBrush(self._item_brush(rec, res)))
-            # CONFIRMED state = a saved human_classification (any of ladder/
-            # staircase/unsure). A manual window alone does NOT confirm. Read
-            # from the record so it restores on reopen (the override persists on
-            # the cloud doc). The green left-border is painted by the delegate.
-            item.setData(_CONFIRMED_ROLE, bool(_human_label(rec)))
-            item.setToolTip(rec.get("filename") or rec.get("record_id") or "")
-            if classifier.is_ladder(res.label):
-                self.ladder_list.addItem(item)
+            h = _human_label(rec)
+            done = bool(h)
+            # Which category column (if any) does this record belong in? A human
+            # label wins; otherwise an un-computable record falls to Flagged.
+            cat = None
+            if h == classifier.HUMAN_LADDER:
+                cat = self.ladder_list
                 n_ladder += 1
-            elif res.label == classifier.LABEL_STAIRCASE:
-                self.staircase_list.addItem(item)
+            elif h == classifier.HUMAN_STAIRCASE:
+                cat = self.staircase_list
                 n_stair += 1
-            else:
-                self.flagged_list.addItem(item)
-                n_flag += 1
+            elif h == classifier.HUMAN_UNSURE:
+                cat = self.flagged_list
+                n_unsure += 1
+            elif not done and not res.computable:
+                cat = self.flagged_list        # bad data, not yet human-reviewed
+                n_baddata += 1
+            if done:
+                n_reviewed += 1
+            # Worklist: a PERMANENT roster of every record, honoring the filter.
+            if (show == "all" or (show == "done" and done)
+                    or (show == "notdone" and not done)):
+                self.worklist.addItem(self._make_item(idx, rec, res))
+            # Category column (human label, or bad-data -> Flagged).
+            if cat is not None:
+                cat.addItem(self._make_item(idx, rec, res))
 
-        classified = n_ladder + n_stair
         total = len(self.records)
-        pct = (100.0 * n_ladder / classified) if classified else 0.0
-        pct_all = (100.0 * n_ladder / total) if total else 0.0
+        n_notdone = total - n_reviewed
+        n_flag = n_unsure + n_baddata
+        self.worklist_box.setTitle(f"WORKLIST — all records  ({total})")
         self.ladder_box.setTitle(f"LADDER  ({n_ladder})")
         self.staircase_box.setTitle(f"STAIRCASE  ({n_stair})")
-        self.flagged_box.setTitle(f"FLAGGED / bad data  ({n_flag})")
+        self.flagged_box.setTitle(f"FLAGGED / unsure + bad data  ({n_flag})")
+        # Ladder % is a fraction of REVIEWED records (honest denominator); it
+        # starts at 0 and the total is shown so progress is visible.
+        pct = (100.0 * n_ladder / n_reviewed) if n_reviewed else 0.0
+        n_border = sum(1 for r in self.results if r.borderline)
         self.pct_label.setText(
-            f"Ladder %: {pct:.1f}% of {classified} classified  "
-            f"·  {pct_all:.1f}% of all {total}  "
-            f"·  borderline: {sum(1 for r in self.results if r.borderline)}  "
-            f"·  overrides: {sum(1 for rec in self.records if _human_label(rec))}")
+            f"Ladder {n_ladder} / reviewed {n_reviewed} / total {total}  "
+            f"·  {pct:.1f}% of reviewed  ·  not done {n_notdone}  "
+            f"·  borderline {n_border}")
+
+    def _make_item(self, idx: int, rec: dict, res) -> QListWidgetItem:
+        item = QListWidgetItem(self._item_text(rec, res))
+        item.setData(Qt.ItemDataRole.UserRole, idx)
+        item.setBackground(QBrush(self._item_brush(rec)))
+        item.setToolTip(rec.get("filename") or rec.get("record_id") or "")
+        return item
 
     def _item_text(self, rec: dict, res) -> str:
         rid = rec.get("record_id") or ""
         short = rid.split("-")[0] if rid else "(no id)"
         badges = []
-        # Handedness badge so S vs R is visible inside the shared LADDER column.
-        if classifier.is_ladder(res.label) and res.ladder_type:
-            badges.append(f"{res.ladder_type}-ladder")
-        if res.borderline:
-            badges.append("⚠borderline")
-        # Mark records running on a hand-set window vs. the default.
-        if classifier._resolve_manual_window(rec.get("manual_window")) is not None:
-            badges.append("✎win")
         h = _human_label(rec)
         if h:
-            # Human override is a coarse family (ladder/staircase/unsure); compare
-            # it against the auto label's family so 'ladder' agrees with either
-            # handedness.
-            if h == "unsure":
-                badges.append("H:unsure?")
-            elif h != classifier.label_family(res.label):
-                badges.append(f"H:{h}✗")
-            else:
-                badges.append(f"H:{h}✓")
-        tail = ("  [" + " ".join(badges) + "]") if badges else ""
+            badges.append(f"✓ {h}")          # DONE marker = the human category
+        if not res.computable:
+            badges.append("bad data")        # classifier couldn't measure it
+        if res.borderline:
+            badges.append("⚠ borderline")
+        # Mark records running on a hand-set window vs. the default.
+        if classifier._resolve_manual_window(rec.get("manual_window")) is not None:
+            badges.append("✎ win")
+        tail = ("  [" + " · ".join(badges) + "]") if badges else ""
         return f"{short} | {_human_readable(rec)}{tail}"
 
-    def _item_brush(self, rec: dict, res) -> QColor:
-        h = _human_label(rec)
-        if h and h != "unsure" and h != classifier.label_family(res.label):
-            return _DISAGREE_TINT
-        if res.borderline:
-            return _BORDERLINE_TINT
-        return {"ladder": _LADDER_TINT,
-                "staircase": _STAIRCASE_TINT}.get(
-                    classifier.label_family(res.label), _FLAGGED_TINT)
+    def _item_brush(self, rec: dict) -> QColor:
+        # Lifecycle: grey (unreviewed) -> whole-strip green on classification.
+        return _CLASSIFIED_GREEN if _human_label(rec) else _UNREVIEWED_GREY
+
+    def _on_worklist_filter_changed(self, index: int):
+        self._worklist_filter = {0: "all", 1: "done", 2: "notdone"}.get(
+            index, "all")
+        self._populate_columns()
+        if 0 <= self.current_index < len(self.records):
+            self._select_index_in_columns(self.current_index)
 
     def _on_item_clicked(self, item: QListWidgetItem):
         idx = item.data(Qt.ItemDataRole.UserRole)
         if idx is None:
             return
-        # Single visual selection across the three lists.
+        # Single visual selection across the lists.
         for lst in self._lists:
             if lst is not item.listWidget():
                 lst.blockSignals(True)
@@ -654,7 +675,7 @@ class CDReviewWindow(QDialog):
             "<b>No verified cloud records.</b> The cloud may be "
             "unconfigured/unreachable, or empty — see the log.")
         self.metrics_label.setText("")
-        self.disagree_banner.setVisible(False)
+        self.review_banner.setVisible(False)
         self.window_status.setText("")
         self.win_min_lbl.setText("—")
         self.win_max_lbl.setText("—")
@@ -698,9 +719,6 @@ class CDReviewWindow(QDialog):
                     f"padding:1px 6px;border-radius:3px;'>"
                     f"{pass_text if ok else fail_text}</span>")
 
-        # Label + handedness + borderline.
-        hand = (f" &nbsp;<span style='color:#555;'>(handedness "
-                f"<b>{res.ladder_type}</b>)</span>" if res.ladder_type else "")
         bl = ""
         if res.borderline:
             bl = (" &nbsp;<span style='background:#ffe5b4;padding:1px 5px;"
@@ -726,18 +744,25 @@ class CDReviewWindow(QDialog):
         lobe_metric = (f"min/max lobe = <b>{_f(res.lobe_ratio, 2)}</b> "
                        f"(threshold ≥ {t_lobe})")
 
-        reason = res.audit_reason or "—"
+        # The reviewer's own decision (not a suggested verdict).
+        human = _human_label(rec)
+        human_line = (f"<b style='color:#155724;'>{human.upper()}</b>"
+                      if human else
+                      "<span style='color:#777;'>unreviewed</span>")
+
+        notes = res.notes or "—"
 
         return f"""
         <div style='font-size:13px;'>
-        <h3 style='margin:2px 0;'>Auto label:
-          <span style='text-transform:uppercase;'>{res.label}</span>{hand}{bl}</h3>
-        <div style='color:#444;'>bisignate couplet:
+        <h3 style='margin:2px 0;'>Computed metrics
+          <span style='font-size:11px;color:#777;'>(no verdict — you decide)</span>{bl}</h3>
+        <div style='color:#444;'>your classification: {human_line}
+          &nbsp;·&nbsp; bisignate couplet:
           <b>{'yes' if res.bisignate else 'no'}</b></div>
         <hr>
         <b>UV bands ({psmin:.0f}–{psmax:.0f} nm search)</b>
           &nbsp;{chip(g.uv_band_detected, "2 BANDS", "1 BAND")}<br>
-        &nbsp;&nbsp;baseline (tail): <b>{_f(res.uv_baseline)}</b><br>
+        &nbsp;&nbsp;baseline (tail, display-only): <b>{_f(res.uv_baseline)}</b><br>
         &nbsp;&nbsp;peak1 (shorter λ): <b>{_f(res.uv_peak1.value)}</b> @ {_wl(res.uv_peak1.wl)}<br>
         &nbsp;&nbsp;peak2 (longer λ): <b>{_f(res.uv_peak2.value)}</b> @ {_wl(res.uv_peak2.wl)}<br>
         &nbsp;&nbsp;inter-band valley: {_wl(res.interband_valley_lambda)}<br>
@@ -755,7 +780,7 @@ class CDReviewWindow(QDialog):
         <b>CD peak ratio</b> &nbsp;{chip(g.lobe_ratio_pass)}<br>
         &nbsp;&nbsp;{lobe_metric}<br>
         <hr>
-        <b>audit reason:</b> {reason}
+        <b>notes:</b> {notes}
         </div>
         """
 
@@ -816,8 +841,8 @@ class CDReviewWindow(QDialog):
         # --- analysis window: shade on BOTH CD and UV at the ACTUAL window the
         # classifier used (res.window). A live slider drag re-draws this box at
         # the candidate window via _draw_window_box; on release the record is
-        # reclassified so res.window == the committed manual window. None for
-        # flagged / single-band records (nothing to shade).
+        # re-measured so res.window == the committed manual window. None for
+        # un-computable / single-band records (nothing to shade).
         self._draw_window_box(res.window_left, res.window_right)
 
         # --- CD: mark the two lobes + the zero-crossing (crossover) ---
@@ -867,7 +892,7 @@ class CDReviewWindow(QDialog):
     def _seed_window_slider(self, rec: dict):
         """Initialize the slider to the record's stored manual_window if present,
         else the global default (classifier.WINDOW_DEFAULT_*). blockSignals so
-        seeding never triggers a spurious commit/reclassify."""
+        seeding never triggers a spurious commit/re-measure."""
         self.window_slider.blockSignals(True)
         self.window_slider.setBounds(_PLOT_X_RANGE[0], _PLOT_X_RANGE[1])
         mw = classifier._resolve_manual_window(rec.get("manual_window"))
@@ -890,7 +915,7 @@ class CDReviewWindow(QDialog):
                 f"<i>Reset to auto</i>.")
         elif res.window_left is not None:
             self.window_status.setText(
-                f"No manual window — classifier uses the <b>auto "
+                f"No manual window — measured under the <b>auto "
                 f"(data-driven)</b> window "
                 f"{res.window_left:.0f}–{res.window_right:.0f} nm. Slider shows "
                 f"the default "
@@ -900,19 +925,19 @@ class CDReviewWindow(QDialog):
         else:
             self.window_status.setText(
                 "No manual window. The auto window is unavailable for this "
-                "record (flagged / single UV band). Drag + release to force a "
-                "manual CD window.")
+                "record (un-computable / single UV band). Drag + release to "
+                "force a manual CD window.")
 
     def _on_window_dragged(self, lo: float, hi: float):
         """Live during a handle drag: update the nm readouts and redraw the
-        shaded box only. Reclassification is DEFERRED to release."""
+        shaded box only. Re-measurement is DEFERRED to release."""
         self.win_min_lbl.setText(f"{lo:.0f} nm")
         self.win_max_lbl.setText(f"{hi:.0f} nm")
         self._draw_window_box(lo, hi)
 
     def _on_window_committed(self, lo: float, hi: float):
-        """On handle RELEASE: set this record's manual_window, reclassify under
-        it, persist BOTH the window and the refreshed auto cache together, and
+        """On handle RELEASE: set this record's manual_window, re-measure under
+        it, persist BOTH the window and the refreshed metrics cache together, and
         refresh the metrics + markers + columns."""
         if not (0 <= self.current_index < len(self.records)):
             return
@@ -922,8 +947,9 @@ class CDReviewWindow(QDialog):
         rec["manual_window"] = mw                       # mirror locally
         res = classifier.classify_record(rec)           # recompute under window
         self.results[idx] = res
-        auto = classifier.auto_classification_doc(res)
-        rec["auto_classification"] = auto               # mirror locally
+        metrics = classifier.computed_metrics_doc(res)
+        rec["computed_metrics"] = metrics               # mirror locally
+        rec.pop("auto_classification", None)            # mirror legacy migration
         self.win_min_lbl.setText(f"{lo:.0f} nm")
         self.win_max_lbl.setText(f"{hi:.0f} nm")
         self.metrics_label.setText(self._metrics_html(rec, res))
@@ -931,11 +957,11 @@ class CDReviewWindow(QDialog):
         self._update_window_status(rec, res)
         self._populate_columns()
         self._select_index_in_columns(idx)
-        self._persist_window(rec.get("record_id"), mw, auto)
+        self._persist_window(rec.get("record_id"), mw, metrics)
 
     def _on_reset_window(self):
         """Clear this record's manual_window (revert to the data-driven window),
-        reclassify, and persist the cleared field + refreshed cache together."""
+        re-measure, and persist the cleared field + refreshed cache together."""
         if not (0 <= self.current_index < len(self.records)):
             return
         idx = self.current_index
@@ -943,20 +969,21 @@ class CDReviewWindow(QDialog):
         rec.pop("manual_window", None)                  # mirror clear locally
         res = classifier.classify_record(rec)           # data-driven again
         self.results[idx] = res
-        auto = classifier.auto_classification_doc(res)
-        rec["auto_classification"] = auto
+        metrics = classifier.computed_metrics_doc(res)
+        rec["computed_metrics"] = metrics
+        rec.pop("auto_classification", None)            # mirror legacy migration
         self._seed_window_slider(rec)                   # back to default seed
         self.metrics_label.setText(self._metrics_html(rec, res))
         self._draw_detail_plots(idx)
         self._update_window_status(rec, res)
         self._populate_columns()
         self._select_index_in_columns(idx)
-        self._persist_window(rec.get("record_id"), None, auto)
+        self._persist_window(rec.get("record_id"), None, metrics)
 
-    def _persist_window(self, rid, manual_window, auto):
-        """Atomically write manual_window (or clear it) + the refreshed auto
-        cache via mongo_db.set_manual_window. Guarded + non-blocking-ish like the
-        override save; a failure is surfaced in the window status line."""
+    def _persist_window(self, rid, manual_window, metrics):
+        """Atomically write manual_window (or clear it) + the refreshed metrics
+        cache via mongo_db.set_manual_window. Guarded; a failure is surfaced in
+        the window status line."""
         if not rid:
             self._log("Manual window not persisted: record has no record_id.")
             self.window_status.setText(
@@ -967,7 +994,7 @@ class CDReviewWindow(QDialog):
         QApplication.processEvents()
         try:
             from mongo_db import set_manual_window
-            res = set_manual_window(rid, manual_window, auto, log=self._log)
+            res = set_manual_window(rid, manual_window, metrics, log=self._log)
         except Exception as e:
             self._log(f"Manual window save failed: {type(e).__name__}: {e}")
             self._log(traceback.format_exc())
@@ -979,7 +1006,7 @@ class CDReviewWindow(QDialog):
             self.window_status.setText(
                 "⚠ Cloud save failed: " + res.get("message", "unknown error"))
 
-    # ------------------------------------------------- manual reclassify ----
+    # ------------------------------------------------- human classify -------
     def _set_detail_enabled(self, enabled: bool):
         for btn in self._human_btns.values():
             btn.setEnabled(enabled)
@@ -1012,8 +1039,8 @@ class CDReviewWindow(QDialog):
             return
         if not rid:
             self.override_status.setText("This record has no record_id — "
-                                         "cannot save override.")
-            self._log("Override not saved: record has no record_id.")
+                                         "cannot save classification.")
+            self._log("Classification not saved: record has no record_id.")
             return
 
         human_doc = {"label": label,
@@ -1024,7 +1051,7 @@ class CDReviewWindow(QDialog):
             from mongo_db import set_human_classification
             res = set_human_classification(rid, human_doc, log=self._log)
         except Exception as e:
-            self._log(f"Override save failed: {type(e).__name__}: {e}")
+            self._log(f"Classification save failed: {type(e).__name__}: {e}")
             self._log(traceback.format_exc())
             res = {"ok": False, "message": str(e)}
         finally:
@@ -1040,57 +1067,95 @@ class CDReviewWindow(QDialog):
         else:
             self.override_status.setText(res.get("message", "Save failed."))
 
+    def _clear_override(self):
+        """Delete a saved human_classification (returns the record to grey /
+        unreviewed and out of its category column). If nothing is saved, just
+        unselect the radios locally."""
+        if not (0 <= self.current_index < len(self.records)):
+            return
+        rec = self.records[self.current_index]
+        rid = rec.get("record_id")
+        if not _human_label(rec):
+            self._set_human_radios(None)
+            self.override_status.setText("No saved classification to clear.")
+            return
+        if not rid:
+            self.override_status.setText("This record has no record_id — "
+                                         "cannot clear.")
+            return
+
+        self.clear_override_btn.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            from mongo_db import set_human_classification
+            # None -> $unset the field on the cloud doc.
+            res = set_human_classification(rid, None, log=self._log)
+        except Exception as e:
+            self._log(f"Clear classification failed: {type(e).__name__}: {e}")
+            self._log(traceback.format_exc())
+            res = {"ok": False, "message": str(e)}
+        finally:
+            self.clear_override_btn.setEnabled(True)
+
+        if res.get("ok"):
+            rec.pop("human_classification", None)          # mirror locally
+            self._set_human_radios(None)
+            self.override_status.setText("Cleared — back to unreviewed.")
+            self._populate_columns()
+            self._select_index_in_columns(self.current_index)
+            self._refresh_override_banner(rec, self.results[self.current_index])
+        else:
+            self.override_status.setText(res.get("message", "Clear failed."))
+
     def _refresh_override_banner(self, rec: dict, res):
         h = _human_label(rec)
         if not h:
-            self.disagree_banner.setVisible(False)
-            self.override_status.setText("No human override yet.")
+            self.review_banner.setVisible(False)
+            self.override_status.setText("Not yet classified.")
             return
         hd = rec.get("human_classification") or {}
         when = (hd.get("reviewed_at") or "")[:19]
         self.override_status.setText(
             f"Saved: {h}" + (f" · {when}Z" if when else ""))
-        if h == "unsure":
-            self._banner("#fff3cd", "#856404",
-                         "Human marked <b>UNSURE</b> — flagged for a second look.")
-        elif h != classifier.label_family(res.label):
-            self._banner(
-                "#f8d7da", "#721c24",
-                f"Human override <b>{h.upper()}</b> DISAGREES with auto "
-                f"<b>{res.label.upper()}</b> — this is a tuning signal.")
-        else:
-            self._banner("#d4edda", "#155724",
-                         f"Human override <b>{h.upper()}</b> agrees with auto.")
+        self._banner(
+            "#d4edda", "#155724",
+            f"Classified as <b>{h.upper()}</b>"
+            + (f" · {when}Z" if when else "")
+            + " — <i>Clear saved</i> returns it to unreviewed.")
 
     def _banner(self, bg, fg, html):
-        self.disagree_banner.setText(html)
-        self.disagree_banner.setStyleSheet(
+        self.review_banner.setText(html)
+        self.review_banner.setStyleSheet(
             f"background:{bg};color:{fg};padding:5px;border-radius:4px;")
-        self.disagree_banner.setVisible(True)
+        self.review_banner.setVisible(True)
 
     # ----------------------------------------------------- cloud caching ----
-    def _sync_auto(self, force: bool):
-        """Write the auto_classification cache for stale/missing records (or
-        all, when force=True). Idempotent; updates the in-memory mirror so
-        repeated syncs become no-ops until the classifier output changes."""
+    def _sync_metrics(self, force: bool):
+        """Write the computed_metrics cache for stale/missing records (or all,
+        when force=True). Also migrates legacy docs: the cloud writers $unset the
+        old auto_classification block, and a record still carrying it is treated
+        as stale so it gets rewritten. Idempotent; updates the in-memory mirror
+        so repeated syncs become no-ops until the measurement output changes."""
         pairs = []
         for rec, res in zip(self.records, self.results):
             rid = rec.get("record_id")
-            auto = classifier.auto_classification_doc(res)
-            stored = rec.get("auto_classification")
-            if force or not _auto_cache_current(stored, auto):
-                rec["auto_classification"] = auto      # mirror locally
+            metrics = classifier.computed_metrics_doc(res)
+            stored = rec.get("computed_metrics")
+            legacy = rec.get("auto_classification") is not None
+            if force or legacy or not _metrics_cache_current(stored, metrics):
+                rec["computed_metrics"] = metrics          # mirror locally
+                rec.pop("auto_classification", None)        # mirror migration
                 if rid:
-                    pairs.append((rid, auto))
+                    pairs.append((rid, metrics))
         if not pairs:
-            self._log("Auto-classification cache already current "
+            self._log("Computed-metrics cache already current "
                       "(nothing to sync).")
             return
         try:
-            from mongo_db import sync_auto_classifications
-            sync_auto_classifications(pairs, log=self._log)
+            from mongo_db import sync_computed_metrics
+            sync_computed_metrics(pairs, log=self._log)
         except Exception as e:
-            self._log(f"Auto-classification sync error: "
+            self._log(f"Computed-metrics sync error: "
                       f"{type(e).__name__}: {e}")
             self._log(traceback.format_exc())
 
@@ -1101,8 +1166,8 @@ class CDReviewWindow(QDialog):
         self.resync_btn.setEnabled(False)
         QApplication.processEvents()
         try:
-            self._log(f"Force re-syncing auto labels for {len(self.records)} "
-                      f"record(s)…")
-            self._sync_auto(force=True)
+            self._log(f"Force re-syncing computed metrics for "
+                      f"{len(self.records)} record(s)…")
+            self._sync_metrics(force=True)
         finally:
             self.resync_btn.setEnabled(True)

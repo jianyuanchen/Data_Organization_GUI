@@ -2,46 +2,48 @@
 CD-shape classifier engine: UV-gated bisignate ladder detector.
 
 PURE ANALYSIS. Operates on a record's spectral arrays (wavelength + CD +
-UV-Vis) and returns a structured, fully-auditable classification result. It
-NEVER reads or writes a file, never touches the DB, never mutates the input
-arrays, and never modifies a cloud document -- the label is derived/computed on
-demand. This is Phase A; the visual two-column review UI is Phase B.
+UV-Vis) and returns a structured, fully-auditable METRICS result. It NEVER reads
+or writes a file, never touches the DB, never mutates the input arrays, and never
+modifies a cloud document -- the metrics are computed on demand. This is Phase A;
+the visual worklist + review UI is Phase B.
 
-Determination is NUMERIC, computed straight from the raw CSV arrays. The Phase B
-plots are AUDIT-ONLY -- they visualize the same numbers and never feed the
-decision. The data is used RAW: no smoothing, no resampling, no value edits. The
-only reshaping is a stable sort by wavelength ASCENDING, because the raw files
-run 700 -> 300 nm and the rest of the procedure assumes index order tracks
-wavelength order. The same sort permutation is applied to all three arrays so
-they stay aligned.
+This module is a MEASURER, not a judge: it computes the objective numbers a human
+needs, but emits NO Ladder/Staircase verdict. The final category is assigned by a
+human in Phase B (human_classification) and is the SINGLE source of truth for
+sorting and stats. The metrics are computed RAW (no smoothing, no resampling, no
+value edits); the only reshaping is a stable sort by wavelength ASCENDING, because
+the raw files run 700 -> 300 nm and the rest of the procedure assumes index order
+tracks wavelength order. The same sort permutation is applied to all three arrays
+so they stay aligned.
 
-Domain context: a *ladder*-type CD signature is a genuine bisignate couplet that
-sits under an evolved two-band UV envelope. The decision is a chain of ordered
-gates (UV bands -> data-driven window -> CD couplet -> handedness -> evolution):
+The metrics are produced through an ordered chain of gates
+(UV bands -> CD window -> CD couplet -> evolution ratios):
 
-  * FLAGGED is reserved for data that cannot be evaluated at all -- empty/short
-    arrays, NaN/inf, a flat UV with no dynamic range, or a required search
-    window with no samples. A *failed gate is STAIRCASE, never FLAGGED.*
-  * A single UV band, an absent CD couplet, or an under-evolved couplet are all
-    real classifications -> STAIRCASE.
-  * Both evolution gates passing on a genuine couplet -> LADDER (S or R by
-    handedness).
+  * UV bands: are there two prominent UV peaks? (peak1/peak2 + locations)
+  * uv_peak_ratio: RAW peak2/peak1 (longer-lambda over shorter-lambda).
+  * CD couplet: a genuine bisignate couplet inside the window (pos/neg lobe).
+  * cd_peak_ratio: smaller-lobe/larger-lobe.
+  * two gate pass/fail booleans (uv_ratio_pass / lobe_ratio_pass) reported as
+    OBJECTIVE evidence -- they do NOT collapse into a verdict here.
+
+Un-computable data (empty/short arrays, NaN/inf, a flat UV with no dynamic range,
+or a window with no samples) yields a result with empty metrics and a note rather
+than raising; the human still sees the record (grey/unreviewed in Phase B).
 
 The CD analysis window is data-driven by default, but a per-record manual_window
 override (set visually in Phase B and persisted on the cloud doc) REPLACES it
 when present; UV detection and the UV ratio gate are unaffected. The window
 actually used is recorded on every result (window_used / window_source) so a
-stored classification always carries the window it was computed under.
+stored metrics result always carries the window it was computed under.
 
-A separate "borderline" flag marks results whose UV ratio or lobe ratio sits
-within +/-BORDERLINE_BAND of its threshold so a human knows to eyeball them; it
-does NOT change the hard label.
+A "borderline" flag marks results whose UV ratio or lobe ratio sits within
++/-BORDERLINE_BAND of its threshold so a human knows to eyeball them.
 
 All thresholds / windows below are PROVISIONAL: Jeff will tune the prominence
 ratio `k` (UV_PROMINENCE_RATIO) and the right-edge fraction `f`
-(BAND2_RIGHT_FRACTION) VISUALLY in Phase B. Because the persisted
-auto_classification is a CACHE derived from these provisional constants, the
-classify+write pass is kept idempotent / safely re-runnable after any retune.
+(BAND2_RIGHT_FRACTION) VISUALLY in Phase B. Because the persisted computed_metrics
+block is a CACHE derived from these provisional constants AND the window used, the
+measure+write pass is kept idempotent / safely re-runnable after any retune.
 
 Dependencies: numpy + scipy.signal.find_peaks (prominence-based peak detection
 on the raw curve -- prominence, not absolute height, is what separates real
@@ -93,34 +95,22 @@ WINDOW_DEFAULT_MIN = 450.0      # nm
 WINDOW_DEFAULT_MAX = 500.0      # nm
 
 # ---- sanity floor (NOT a tuning knob) -------------------------------------
-# Below this many finite, aligned samples a record is treated as "short" ->
-# FLAGGED. find_peaks needs >= 3 points just to see one interior maximum; we
-# keep a little headroom so a window restriction still leaves something usable.
+# Below this many finite, aligned samples a record is treated as "short" -> its
+# metrics are un-computable. find_peaks needs >= 3 points just to see one interior
+# maximum; we keep a little headroom so a window restriction still leaves
+# something usable.
 MIN_USABLE_SAMPLES = 5
 
 
-# ---- canonical labels ------------------------------------------------------
-LABEL_LADDER_S = "Ladder-S"
-LABEL_LADDER_R = "Ladder-R"
-LABEL_STAIRCASE = "Staircase"
-LABEL_FLAGGED = "Flagged"
-LABELS = (LABEL_LADDER_S, LABEL_LADDER_R, LABEL_STAIRCASE, LABEL_FLAGGED)
-
-
-def is_ladder(label: Optional[str]) -> bool:
-    """True for either handedness of ladder (the LADDER column in Phase B)."""
-    return label in (LABEL_LADDER_S, LABEL_LADDER_R)
-
-
-def label_family(label: Optional[str]) -> str:
-    """Collapse a hard label to a coarse family ('ladder'/'staircase'/'flagged')
-    so a human 'ladder'/'staircase' override can be compared against either
-    handedness of the auto label."""
-    if is_ladder(label):
-        return "ladder"
-    if label == LABEL_STAIRCASE:
-        return "staircase"
-    return "flagged"
+# ---- human category vocabulary ---------------------------------------------
+# The classifier emits NO verdict. The ONLY category label is the human's review
+# decision (human_classification), one of these three. Phase B sorts and tallies
+# on these; classifier.py just owns the vocabulary so the UI and any cloud query
+# share one spelling.
+HUMAN_LADDER = "ladder"
+HUMAN_STAIRCASE = "staircase"
+HUMAN_UNSURE = "unsure"
+HUMAN_LABELS = (HUMAN_LADDER, HUMAN_STAIRCASE, HUMAN_UNSURE)
 
 
 # ===========================================================================
@@ -146,15 +136,18 @@ class Gates:
 
 @dataclass
 class ClassificationResult:
-    label: str                                   # one of LABELS
-    ladder_type: Optional[str] = None            # "S" | "R" | None
+    """Objective MEASUREMENTS for one record -- NO verdict. The classifier is a
+    measurer; the Ladder/Staircase category is assigned by a human in Phase B.
+    Every field is a computed metric, a gate boolean, or a note explaining why a
+    metric is absent (un-computable data)."""
+    computable: bool = True                       # False = un-computable / bad data
     bisignate: bool = False                       # genuine CD couplet present
     borderline: bool = False
     borderline_flags: list = field(default_factory=list)   # metric names in band
-    audit_reason: str = ""                        # human-readable "why this label"
+    notes: str = ""                               # objective measurement notes
 
     # --- UV evidence ---
-    uv_baseline: Optional[float] = None
+    uv_baseline: Optional[float] = None              # display-only (far-red tail)
     uv_peak1: Point = field(default_factory=Point)   # shorter-lambda band
     uv_peak2: Point = field(default_factory=Point)   # longer-lambda band
     interband_valley_lambda: Optional[float] = None  # = window LEFT edge (auto)
@@ -163,18 +156,17 @@ class ClassificationResult:
     window_source: Optional[str] = None              # "manual" | "data-driven"
     uv_two_peak_ratio: Optional[float] = None        # p2/p1 (raw, no baseline)
 
-    # --- CD evidence (inside the data-driven window) ---
+    # --- CD evidence (inside the window) ---
     cd_pos_lobe: Point = field(default_factory=Point)
     cd_neg_lobe: Point = field(default_factory=Point)
     lobe_ratio: Optional[float] = None               # min(|+|,|-|)/max(|+|,|-|)
     crossover_wavelength: Optional[float] = None      # CD zero-crossing (interp)
 
     gates: Gates = field(default_factory=Gates)
-    reasons: list = field(default_factory=list)       # ordered audit notes
 
     @property
     def window(self) -> tuple:
-        """The data-driven CD window as (left, right)."""
+        """The CD window as (left, right)."""
         return (self.window_left, self.window_right)
 
     def to_dict(self) -> dict:
@@ -252,11 +244,12 @@ def _zero_crossing_wl(wl: np.ndarray, cd: np.ndarray,
 # ===========================================================================
 # CLASSIFICATION CORE
 # ===========================================================================
-def _flagged(reason: str, **partial) -> ClassificationResult:
-    """Build a FLAGGED result (un-computable data) carrying whatever partial
-    evidence was gathered before the procedure had to stop."""
-    return ClassificationResult(
-        label=LABEL_FLAGGED, audit_reason=reason, reasons=[reason], **partial)
+def _uncomputable(reason: str, **partial) -> ClassificationResult:
+    """Build a result for UN-COMPUTABLE data (empty/short/non-finite arrays, flat
+    UV, or a window with no samples): empty metrics + a note, no verdict, and
+    computable=False so Phase B can file it under FLAGGED / bad data. The human
+    still sees the record (grey/unreviewed) and decides in Phase B."""
+    return ClassificationResult(computable=False, notes=reason, **partial)
 
 
 def _near(value: Optional[float], threshold: float) -> bool:
@@ -295,30 +288,32 @@ def _resolve_manual_window(manual_window) -> Optional[tuple]:
 
 def classify_arrays(wavelength, cd, uv,
                     manual_window=None) -> ClassificationResult:
-    """Classify ONE record from its raw spectral arrays. The primary entry point.
+    """Measure ONE record from its raw spectral arrays. The primary entry point.
 
     `wavelength`, `cd`, `uv` are parallel numeric sequences (lists or numpy
-    arrays). `g` is not needed for the decision. The procedure follows the
-    ordered gates documented at the top of the module; each early exit records
-    WHICH gate stopped it. Any un-computable input yields a FLAGGED result with
-    a reason rather than raising.
+    arrays). `g` is not needed. Returns a ClassificationResult of OBJECTIVE
+    metrics (UV bands, raw peak ratio, CD couplet, lobe ratio, the two gate
+    booleans, crossover, window used) -- NO Ladder/Staircase verdict. Any
+    un-computable input yields a result with empty metrics + a note rather than
+    raising.
 
     `manual_window` is an optional per-record override of the CD analysis window
     ({"min_nm", "max_nm"} dict or (lo, hi) pair). When present and valid it
-    REPLACES the data-driven window (steps 4-7 read the CD couplet inside it);
-    UV band detection and the UV peak2/peak1 ratio gate are UNAFFECTED. When
+    REPLACES the data-driven window (the CD couplet is read inside it); UV band
+    detection and the UV peak2/peak1 ratio gate are UNAFFECTED. When
     absent/malformed the window is data-driven exactly as before.
     """
     prepared = _prepare(wavelength, cd, uv)
     if prepared is None:
-        return _flagged("empty/short or non-finite arrays "
-                        "(fewer than %d usable samples)" % MIN_USABLE_SAMPLES)
+        return _uncomputable("empty/short or non-finite arrays "
+                             "(fewer than %d usable samples)"
+                             % MIN_USABLE_SAMPLES)
     wl, cdv, uvv = prepared
 
     # --- step 1: UV baseline from the far-red flat tail ---------------------
     tail = (wl >= BASELINE_TAIL_MIN) & (wl <= BASELINE_TAIL_MAX)
     if not tail.any():
-        return _flagged(
+        return _uncomputable(
             "no UV samples in baseline tail "
             f"[{BASELINE_TAIL_MIN:.0f}-{BASELINE_TAIL_MAX:.0f} nm]")
     baseline = float(np.mean(uvv[tail]))
@@ -326,13 +321,13 @@ def classify_arrays(wavelength, cd, uv,
     # Per-record UV dynamic range that scales the prominence threshold (k).
     uv_span = float(uvv.max() - uvv.min())
     if uv_span <= 0.0:
-        return _flagged("UV signal is flat (no dynamic range)",
-                        uv_baseline=baseline)
+        return _uncomputable("UV signal is flat (no dynamic range)",
+                             uv_baseline=baseline)
 
     # --- step 2: UV band detection (the "two peaks in one band" criterion) --
     win = (wl >= UV_PEAK_SEARCH_MIN) & (wl <= UV_PEAK_SEARCH_MAX)
     if not win.any():
-        return _flagged(
+        return _uncomputable(
             "no UV samples in search window "
             f"[{UV_PEAK_SEARCH_MIN:.0f}-{UV_PEAK_SEARCH_MAX:.0f} nm]",
             uv_baseline=baseline)
@@ -342,16 +337,15 @@ def classify_arrays(wavelength, cd, uv,
     peak_idx, props = find_peaks(uv_w, prominence=prominence)
 
     if peak_idx.size < 2:
-        # NOT bisignate: a single (or absent) UV band -> staircase, not flagged.
-        # Still report the most prominent / largest absorbance as peak1 for audit.
+        # Only a single (or no) prominent UV band -> not bisignate. A MEASUREMENT,
+        # not a verdict: report the largest absorbance as peak1 for the human to
+        # eyeball; no CD window/couplet is computed.
         if peak_idx.size == 1:
             i1 = int(peak_idx[0])
         else:
             i1 = int(np.argmax(uv_w))
         return ClassificationResult(
-            label=LABEL_STAIRCASE,
-            audit_reason="single UV band",
-            reasons=["single UV band"],
+            notes="single UV band",
             uv_baseline=baseline,
             uv_peak1=Point(float(wl_w[i1]), float(uv_w[i1])),
             gates=Gates(uv_band_detected=False),
@@ -410,7 +404,7 @@ def classify_arrays(wavelength, cd, uv,
         window_source=window_source,
     )
     if not inwin.any():
-        return _flagged(
+        return _uncomputable(
             f"no CD samples in {window_source} window "
             f"[{left:.0f}-{right:.0f} nm]", **common)
     wl_in, cd_in = wl[inwin], cdv[inwin]
@@ -445,61 +439,45 @@ def classify_arrays(wavelength, cd, uv,
     common["lobe_ratio"] = lobe_ratio
 
     if not couplet:
-        reason = "no CD couplet"
         return ClassificationResult(
-            label=LABEL_STAIRCASE, audit_reason=reason, reasons=[reason],
+            notes="no CD couplet", bisignate=False,
             gates=Gates(uv_band_detected=True, cd_couplet=False),
             **common)
 
-    # --- step 5: handedness (only ASSIGNS R vs S; never disqualifies) -------
-    # Scanning LONG -> SHORT lambda: positive lobe first (longer lambda) -> S;
-    # negative lobe first (longer lambda) -> R. (R is theoretical/unseen.)
-    ladder_type = "S" if pos_lobe.wl > neg_lobe.wl else "R"
-
-    # --- step 6: evolution gates (BOTH must pass to confirm a ladder) -------
-    reasons: list = []
+    # --- evolution gates: reported as OBJECTIVE evidence, NOT a verdict ------
+    # Both ratios are measured against their thresholds; the booleans are shown
+    # to the human, who makes the Ladder/Staircase call. The classifier does NOT
+    # collapse them into a label here, and computes no handedness.
+    notes: list = []
     # RAW peak2/peak1 ratio (no baseline subtraction).
     uv_ratio_pass = (uv_two_peak_ratio is not None
                      and uv_two_peak_ratio >= UV_RATIO_THRESHOLD)
     if uv_two_peak_ratio is None:
-        reasons.append("UV peak1 at/below zero; peak2/peak1 undefined")
+        notes.append("UV peak1 at/below zero; peak2/peak1 undefined")
     elif not uv_ratio_pass:
-        reasons.append("UV peak2/peak1 below 0.75")
+        notes.append("UV peak2/peak1 below threshold")
 
     lobe_ratio_pass = (lobe_ratio is not None
                        and lobe_ratio >= LOBE_RATIO_THRESHOLD)
     if not lobe_ratio_pass:
-        reasons.append("couplet under-evolved (<50%)")
+        notes.append("lobe ratio below threshold")
 
     gates = Gates(uv_band_detected=True, cd_couplet=True,
                   uv_ratio_pass=uv_ratio_pass, lobe_ratio_pass=lobe_ratio_pass)
 
-    # --- step 9: borderline (does NOT change the hard label) ----------------
+    # --- borderline: a metric sits within +/-BORDERLINE_BAND of its threshold -
     borderline_flags: list = []
     if _near(uv_two_peak_ratio, UV_RATIO_THRESHOLD):
         borderline_flags.append("uv_two_peak_ratio")
     if _near(lobe_ratio, LOBE_RATIO_THRESHOLD):
         borderline_flags.append("lobe_ratio")
 
-    # --- step 7: result -----------------------------------------------------
-    if uv_ratio_pass and lobe_ratio_pass:
-        label = LABEL_LADDER_S if ladder_type == "S" else LABEL_LADDER_R
-        reasons.insert(0, f"bisignate couplet confirmed; "
-                          f"both evolution gates passed ({ladder_type}-ladder)")
-    else:
-        label = LABEL_STAIRCASE
-        # couplet is real but not yet evolved -> staircase this round.
-        reasons.insert(0, "genuine couplet but under-evolved")
-
     return ClassificationResult(
-        label=label,
-        ladder_type=ladder_type,
         bisignate=True,
         borderline=bool(borderline_flags),
         borderline_flags=borderline_flags,
-        audit_reason="; ".join(reasons),
+        notes="; ".join(notes),
         gates=gates,
-        reasons=reasons,
         **common,
     )
 
@@ -523,9 +501,9 @@ def classify_record(rec: dict) -> ClassificationResult:
 def thresholds_snapshot() -> dict:
     """The PROVISIONAL tuning constants as a plain dict, sourced straight from
     the module-level constants above (never duplicate the numbers elsewhere --
-    read them from here). Embedded in every auto_classification cache doc so a
-    later pass can detect that k/f or any threshold changed and the cache is
-    stale, and re-run the (idempotent) classify+write pass.
+    read them from here). Embedded in every computed_metrics cache doc so a later
+    pass can detect that k/f or any threshold changed and the cache is stale, and
+    re-run the (idempotent) measure+write pass.
     """
     return {
         "uv_peak_search_nm": [UV_PEAK_SEARCH_MIN, UV_PEAK_SEARCH_MAX],
@@ -543,26 +521,25 @@ def _pt(p: Point) -> list:
     return [p.wl, p.value]
 
 
-def auto_classification_doc(result: ClassificationResult) -> dict:
-    """Compact, queryable cache document for a cloud doc's `auto_classification`
-    field: the hard label + handedness + borderline flag + the key metrics
-    (both ratios, peak / lobe / crossover locations) + per-gate booleans + the
-    thresholds snapshot that produced them + a UTC timestamp.
+def computed_metrics_doc(result: ClassificationResult) -> dict:
+    """Compact, queryable cache document for a cloud doc's `computed_metrics`
+    field: the OBJECTIVE metrics only (both ratios, peak / lobe / crossover
+    locations, the bisignate + borderline flags, the per-gate booleans) + the
+    thresholds snapshot that produced them + a UTC timestamp. NO verdict and NO
+    handedness -- the human's human_classification is the only category label.
 
     This is a REFRESHABLE CACHE derived from PROVISIONAL thresholds AND the
-    window the record was classified under: re-run the (idempotent) classify+
-    write pass whenever k/f or the constants above change, OR whenever a
-    record's manual_window changes. `window_used` records the actual window so a
-    stored result always carries the window it was computed under. Contains only
-    derived scalars -- NEVER the spectral arrays.
+    window the record was measured under: re-run the (idempotent) measure+write
+    pass whenever k/f or the constants above change, OR whenever a record's
+    manual_window changes. `window_used` records the actual window so a stored
+    result always carries the window it was computed under. Contains only derived
+    scalars -- NEVER the spectral arrays.
     """
     return {
-        "label": result.label,
-        "ladder_type": result.ladder_type,
         "bisignate": result.bisignate,
         "borderline": result.borderline,
         "borderline_flags": list(result.borderline_flags),
-        "audit_reason": result.audit_reason,
+        "notes": result.notes,
         "uv_baseline": result.uv_baseline,
         "uv_peak1": _pt(result.uv_peak1),
         "uv_peak2": _pt(result.uv_peak2),
@@ -575,7 +552,6 @@ def auto_classification_doc(result: ClassificationResult) -> dict:
         "lobe_ratio": result.lobe_ratio,
         "crossover_wavelength": result.crossover_wavelength,
         "gates": asdict(result.gates),
-        "reasons": list(result.reasons),
         "thresholds": thresholds_snapshot(),
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -638,36 +614,29 @@ def _is_verified(rec: dict) -> bool:
 
 
 def print_tally(results: list, log=print) -> dict:
-    """Print and return the summary tally over a list of (rec, result) pairs."""
+    """Print and return a summary tally of OBJECTIVE measurements over a list of
+    (rec, result) pairs. NO verdict counts -- the classifier no longer labels; a
+    human assigns Ladder/Staircase in Phase B."""
     total = len(results)
-    n_ladder_s = sum(1 for _, r in results if r.label == LABEL_LADDER_S)
-    n_ladder_r = sum(1 for _, r in results if r.label == LABEL_LADDER_R)
-    n_ladder = n_ladder_s + n_ladder_r
-    n_stair = sum(1 for _, r in results if r.label == LABEL_STAIRCASE)
-    n_flag = sum(1 for _, r in results if r.label == LABEL_FLAGGED)
+    n_two_band = sum(1 for _, r in results if r.gates.uv_band_detected)
+    n_couplet = sum(1 for _, r in results if r.gates.cd_couplet)
+    n_both_gates = sum(1 for _, r in results
+                       if r.gates.uv_ratio_pass and r.gates.lobe_ratio_pass)
     n_border = sum(1 for _, r in results if r.borderline)
-    classified = n_ladder + n_stair
 
     log("")
     log("=" * 64)
-    log("CLASSIFICATION SUMMARY")
-    log(f"  total records          : {total}")
-    log(f"  ladder (S / R)         : {n_ladder}  ({n_ladder_s} S / {n_ladder_r} R)")
-    log(f"  staircase              : {n_stair}")
-    log(f"  flagged                : {n_flag}")
-    log(f"  borderline             : {n_border}  (marked for human review)")
-    if total:
-        log(f"  ladder % (of all)      : {100.0 * n_ladder / total:.1f}%")
-    if classified:
-        log(f"  ladder % (of classified): "
-            f"{100.0 * n_ladder / classified:.1f}%")
+    log("MEASUREMENT SUMMARY  (objective metrics -- no verdict)")
+    log(f"  total records           : {total}")
+    log(f"  two UV bands detected    : {n_two_band}")
+    log(f"  genuine CD couplet       : {n_couplet}")
+    log(f"  both evolution gates ok  : {n_both_gates}")
+    log(f"  borderline               : {n_border}  (marked for human review)")
     log("=" * 64)
 
     return {
-        "total": total, "ladder": n_ladder, "ladder_s": n_ladder_s,
-        "ladder_r": n_ladder_r, "staircase": n_stair, "flagged": n_flag,
-        "borderline": n_border,
-        "ladder_pct": (100.0 * n_ladder / total) if total else 0.0,
+        "total": total, "two_band": n_two_band, "couplet": n_couplet,
+        "both_gates": n_both_gates, "borderline": n_border,
     }
 
 
@@ -704,15 +673,15 @@ def run_cloud_classification(query: dict | None = None, log=print,
         log("No cloud records to classify.")
         return []
 
-    log(f"\nClassifying {len(records)} cloud record(s)...\n")
+    log(f"\nMeasuring {len(records)} cloud record(s)...\n")
     results: list = []
     for i, rec in enumerate(records):
         res = classify_record(rec)
         results.append((rec, res))
-        log(f"{_record_label(rec, i)}  {res.label.upper():<10} "
+        log(f"{_record_label(rec, i)}  "
             f"{_borderline_text(res):<24} {_format_metrics(res)}")
-        if res.audit_reason:
-            log(f"        reason: {res.audit_reason}")
+        if res.notes:
+            log(f"        notes: {res.notes}")
 
     print_tally(results, log=log)
     return results

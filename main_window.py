@@ -574,10 +574,10 @@ class MainWindow(QMainWindow):
         browse_cloud.clicked.connect(self.on_browse_cloud)
         cd_review = QPushButton("CD Review")
         cd_review.setToolTip(
-            "Open the CD-shape review window: classify the verified cloud "
-            "records as ladder vs staircase (Phase A classifier), audit each "
-            "decision, and record a human override. Spectra are never "
-            "modified.")
+            "Open the CD-shape review window: the classifier MEASURES the "
+            "verified cloud records (UV/CD metrics, no verdict) and a left-hand "
+            "worklist tracks progress as you classify each one Ladder / "
+            "Staircase / Unsure. Spectra are never modified.")
         cd_review.clicked.connect(self.on_open_cd_review)
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
