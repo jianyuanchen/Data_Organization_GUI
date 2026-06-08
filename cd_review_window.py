@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QDialog, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
-    QVBoxLayout, QWidget,
+    QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import (
@@ -70,6 +70,35 @@ _STAIRCASE_TINT = QColor("#e7f1fb")   # light blue
 _FLAGGED_TINT = QColor("#d3d3d3")     # gray
 _BORDERLINE_TINT = QColor("#ffe5b4")  # peach -- "eyeball this one"
 _DISAGREE_TINT = QColor("#f8d7da")    # pink/red -- human vs auto disagreement
+
+# CONFIRMED = a human_classification override is saved on the record. Drawn as a
+# solid SATURATED-green left-border by _ConfirmedBorderDelegate -- a STATE that
+# is independent of the row's background tint (label/borderline/disagreement),
+# and deliberately distinct from the light _LADDER_TINT so it never reads as
+# "this row is in the ladder column".
+_CONFIRMED_BORDER = QColor("#1e7e34")  # solid dark green
+_CONFIRMED_ROLE = Qt.ItemDataRole.UserRole + 1   # bool: human override saved
+
+
+class _ConfirmedBorderDelegate(QStyledItemDelegate):
+    """Paints a solid green left-border on any list entry flagged CONFIRMED
+    (record carries a saved human_classification), on top of the normal row
+    background. The border is a state marker that coexists with every tint --
+    e.g. a confirmed row whose human label disagrees with auto keeps its pink
+    background AND gets the green border."""
+
+    _WIDTH = 5   # px
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.data(_CONFIRMED_ROLE):
+            r = option.rect
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.fillRect(
+                QRect(r.left(), r.top(), self._WIDTH, r.height()),
+                _CONFIRMED_BORDER)
+            painter.restore()
 
 
 def _human_readable(rec: dict) -> str:
@@ -337,15 +366,18 @@ class CDReviewWindow(QDialog):
         legend = QLabel(
             "Tints: ladder=green, staircase=blue, flagged=gray · "
             "⚠ peach = borderline (±%.2f of the UV/lobe ratio threshold) · "
-            "pink = human override disagrees with auto."
+            "pink = human override disagrees with auto · "
+            "green left-border = CONFIRMED (human override saved)."
             % classifier.BORDERLINE_BAND)
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#555;font-size:11px;")
         left_v.addWidget(legend)
 
+        self._confirmed_delegate = _ConfirmedBorderDelegate(self)
         for lst in (self.ladder_list, self.staircase_list, self.flagged_list):
             lst.setSelectionMode(
                 QAbstractItemView.SelectionMode.SingleSelection)
+            lst.setItemDelegate(self._confirmed_delegate)
             lst.itemClicked.connect(self._on_item_clicked)
             self._lists.append(lst)
 
@@ -528,6 +560,11 @@ class CDReviewWindow(QDialog):
             item = QListWidgetItem(self._item_text(rec, res))
             item.setData(Qt.ItemDataRole.UserRole, idx)
             item.setBackground(QBrush(self._item_brush(rec, res)))
+            # CONFIRMED state = a saved human_classification (any of ladder/
+            # staircase/unsure). A manual window alone does NOT confirm. Read
+            # from the record so it restores on reopen (the override persists on
+            # the cloud doc). The green left-border is painted by the delegate.
+            item.setData(_CONFIRMED_ROLE, bool(_human_label(rec)))
             item.setToolTip(rec.get("filename") or rec.get("record_id") or "")
             if classifier.is_ladder(res.label):
                 self.ladder_list.addItem(item)
@@ -670,17 +707,20 @@ class CDReviewWindow(QDialog):
                   "border-radius:3px;'>BORDERLINE: "
                   f"{', '.join(res.borderline_flags)}</span>")
 
-        win = (f"[{_wl(res.window_left)} … {_wl(res.window_right)}]"
-               if res.window_left is not None else "—")
-        if res.window_source == "manual":
-            win_src = ("<span style='color:#7a5c00;font-weight:bold;'>"
-                       "manual</span>")
-        elif res.window_source == "data-driven":
-            win_src = "auto (data-driven)"
+        # CD window line reflects the MANUAL-selection model: show the saved
+        # manual window, else "(default)" (the global default seed) when the
+        # record has no manual_window of its own.
+        mw = classifier._resolve_manual_window(rec.get("manual_window"))
+        if mw is not None:
+            cd_window = (f"CD window <span style='color:#7a5c00;"
+                         f"font-weight:bold;'>(manual)</span>: "
+                         f"<b>[{_wl(mw[0])} … {_wl(mw[1])}]</b>")
         else:
-            win_src = "—"
+            cd_window = (f"CD window <b>(default)</b>: "
+                         f"[{_wl(classifier.WINDOW_DEFAULT_MIN)} … "
+                         f"{_wl(classifier.WINDOW_DEFAULT_MAX)}]")
 
-        uv_ratio_metric = (f"peak2/peak1 (baseline-subtracted) = "
+        uv_ratio_metric = (f"peak2/peak1 (raw) = "
                            f"<b>{_f(res.uv_two_peak_ratio, 2)}</b> "
                            f"(threshold ≥ {t_uv})")
         lobe_metric = (f"min/max lobe = <b>{_f(res.lobe_ratio, 2)}</b> "
@@ -701,9 +741,9 @@ class CDReviewWindow(QDialog):
         &nbsp;&nbsp;peak1 (shorter λ): <b>{_f(res.uv_peak1.value)}</b> @ {_wl(res.uv_peak1.wl)}<br>
         &nbsp;&nbsp;peak2 (longer λ): <b>{_f(res.uv_peak2.value)}</b> @ {_wl(res.uv_peak2.wl)}<br>
         &nbsp;&nbsp;inter-band valley: {_wl(res.interband_valley_lambda)}<br>
-        &nbsp;&nbsp;CD window used ({win_src}): <b>{win}</b><br>
+        &nbsp;&nbsp;{cd_window}<br>
         <br>
-        <b>Evolution gate — UV</b> &nbsp;{chip(g.uv_ratio_pass)}<br>
+        <b>UV peak ratio</b> &nbsp;{chip(g.uv_ratio_pass)}<br>
         &nbsp;&nbsp;{uv_ratio_metric}<br>
         <br>
         <b>CD couplet (inside window)</b>
@@ -712,7 +752,7 @@ class CDReviewWindow(QDialog):
         &nbsp;&nbsp;negative lobe: <b>{_f(res.cd_neg_lobe.value)}</b> @ {_wl(res.cd_neg_lobe.wl)}<br>
         &nbsp;&nbsp;crossover (interp): <b>{_wl(res.crossover_wavelength)}</b><br>
         <br>
-        <b>Evolution gate — CD lobes</b> &nbsp;{chip(g.lobe_ratio_pass)}<br>
+        <b>CD peak ratio</b> &nbsp;{chip(g.lobe_ratio_pass)}<br>
         &nbsp;&nbsp;{lobe_metric}<br>
         <hr>
         <b>audit reason:</b> {reason}

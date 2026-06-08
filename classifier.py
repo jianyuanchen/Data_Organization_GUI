@@ -78,7 +78,7 @@ BAND2_RIGHT_FRACTION = 0.15
 BASELINE_TAIL_MIN = 650.0       # nm
 BASELINE_TAIL_MAX = 700.0       # nm
 
-UV_RATIO_THRESHOLD = 0.75       # peak2/peak1 evolution gate (baseline-subtracted)
+UV_RATIO_THRESHOLD = 0.75       # raw peak2/peak1 ratio gate (no baseline)
 LOBE_RATIO_THRESHOLD = 0.50     # smaller-lobe/larger-lobe evolution gate
 
 # +/- band around each threshold -> flag for review (does NOT change the label).
@@ -161,7 +161,7 @@ class ClassificationResult:
     window_left: Optional[float] = None
     window_right: Optional[float] = None
     window_source: Optional[str] = None              # "manual" | "data-driven"
-    uv_two_peak_ratio: Optional[float] = None        # (p2-base)/(p1-base)
+    uv_two_peak_ratio: Optional[float] = None        # p2/p1 (raw, no baseline)
 
     # --- CD evidence (inside the data-driven window) ---
     cd_pos_lobe: Point = field(default_factory=Point)
@@ -365,9 +365,9 @@ def classify_arrays(wavelength, cd, uv,
     peak1 = Point(float(wl_w[i1]), float(uv_w[i1]))
     peak2 = Point(float(wl_w[i2]), float(uv_w[i2]))
 
-    # Baseline-subtracted band heights -- used by both the data-driven RIGHT
-    # edge and the step-6 UV ratio gate, so compute once regardless of window.
-    peak1_height = float(uv_w[i1]) - baseline
+    # Band-2 height above baseline -- used ONLY by the data-driven RIGHT edge
+    # (decay to a fraction of this). The UV ratio gate uses RAW peak values, so
+    # the baseline no longer feeds the ratio (it stays for display + this edge).
     peak2_height = float(uv_w[i2]) - baseline
 
     # --- step 3: resolve the CD analysis window [LEFT, RIGHT] ---------------
@@ -430,11 +430,13 @@ def classify_arrays(wavelength, cd, uv,
     common["crossover_wavelength"] = crossover
 
     # --- step 6 metrics (computed regardless so Phase B can show them) ------
-    # peak1_height / peak2_height were computed above (baseline-subtracted).
-    if peak1_height > 0.0:
-        uv_two_peak_ratio = peak2_height / peak1_height
+    # RAW peak2/peak1 ratio (longer-lambda over shorter-lambda), NOT baseline-
+    # subtracted. uv_baseline is kept for display only and does not feed this.
+    p1_raw, p2_raw = peak1.value, peak2.value
+    if p1_raw > 0.0:
+        uv_two_peak_ratio = p2_raw / p1_raw
     else:
-        uv_two_peak_ratio = None        # band-1 at/below baseline -> undefined
+        uv_two_peak_ratio = None        # band-1 at/below zero -> undefined
     common["uv_two_peak_ratio"] = uv_two_peak_ratio
 
     big = max(abs(pos_lobe.value), abs(neg_lobe.value))
@@ -456,11 +458,11 @@ def classify_arrays(wavelength, cd, uv,
 
     # --- step 6: evolution gates (BOTH must pass to confirm a ladder) -------
     reasons: list = []
-    # Baseline-subtracted heights, consistent with the right-edge decay calc.
+    # RAW peak2/peak1 ratio (no baseline subtraction).
     uv_ratio_pass = (uv_two_peak_ratio is not None
                      and uv_two_peak_ratio >= UV_RATIO_THRESHOLD)
     if uv_two_peak_ratio is None:
-        reasons.append("UV peak1 at/below baseline; peak2/peak1 undefined")
+        reasons.append("UV peak1 at/below zero; peak2/peak1 undefined")
     elif not uv_ratio_pass:
         reasons.append("UV peak2/peak1 below 0.75")
 
