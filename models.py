@@ -121,6 +121,17 @@ HIDDEN_COLUMNS = ("record_id", "flags", "verified", "verified_date", "added_by",
                   "batch_id", "review_status", "parse_error")
 VISIBLE_COLUMNS = [c for c in COLUMNS if c not in HIDDEN_COLUMNS]
 
+# Left-to-right display order for the MAIN staging table ONLY. A pure reordering
+# of VISIBLE_COLUMNS -- the SAME set of columns (no additions/removals): six key
+# fields are pulled to the front, and every other column keeps its existing
+# relative order behind them. This deliberately does NOT change COLUMNS (the
+# SQLite schema order) or VISIBLE_COLUMNS (the verification window's field
+# order); it is purely the staging grid's column layout.
+_STAGING_FRONT = ("p1_name", "p2_name", "ratio", "speed_mm_s",
+                  "film_state", "anneal_temp")
+STAGING_COLUMNS = ([c for c in _STAGING_FRONT if c in VISIBLE_COLUMNS]
+                   + [c for c in VISIBLE_COLUMNS if c not in _STAGING_FRONT])
+
 
 # Row-tint hex codes per review_status. Shared between the verification
 # window's sidebar and the main staging table so the two views stay in

@@ -30,7 +30,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu, QDialog,
 )
 
-from models import COLUMNS, REVIEW_STATUS_COLORS, VISIBLE_COLUMNS, canon_path
+from models import (COLUMNS, REVIEW_STATUS_COLORS, STAGING_COLUMNS,
+                    VISIBLE_COLUMNS, canon_path)
 from parser import parse_filename
 from database import DB
 
@@ -680,10 +681,13 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget()
         # Hidden user-metadata columns (record_id, flags, verified, ...) are
-        # stored in the DB and round-tripped on edits, but never displayed
-        # here -- VISIBLE_COLUMNS filters them out of the staging view.
-        self.table.setColumnCount(len(VISIBLE_COLUMNS))
-        self.table.setHorizontalHeaderLabels(VISIBLE_COLUMNS)
+        # stored in the DB and round-tripped on edits, but never displayed here.
+        # STAGING_COLUMNS is the (hidden-filtered) VISIBLE_COLUMNS in the
+        # staging table's chosen left-to-right order -- header, cells, and the
+        # edit index->field map below all key off this one list so they stay
+        # aligned.
+        self.table.setColumnCount(len(STAGING_COLUMNS))
+        self.table.setHorizontalHeaderLabels(STAGING_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
         # Row-level multi-select so the user can Ctrl/Shift-click groups of
@@ -1899,18 +1903,19 @@ class MainWindow(QMainWindow):
             is_unparsed = row.get("review_status") == "unparsed"
             tip = (f"Parse error: {row['parse_error']}"
                    if is_unparsed and row.get("parse_error") else "")
-            # Subtle row markers on the leftmost cell (csv_path), no color.
-            # Color is reserved for review_status tinting -- these glyphs
-            # stay orthogonal so promoted/edited/tinted can coexist.
+            # Subtle row markers on the csv_path cell, no color. Color is
+            # reserved for review_status tinting -- these glyphs stay orthogonal
+            # so promoted/edited/tinted can coexist. Keyed by column NAME (not
+            # position) so they stay on csv_path regardless of its column order.
             #   '*' (asterisk)  -> manually edited
             #   '^' (caret)     -> promoted to MongoDB Atlas
             # Both -> '^*'; neither -> no prefix.
             edited_mark = bool(row.get("edited"))
             promoted_mark = bool(row.get("promoted"))
             promoted_at = row.get("promoted_at") or ""
-            for c, col in enumerate(VISIBLE_COLUMNS):
+            for c, col in enumerate(STAGING_COLUMNS):
                 val = "" if row[col] is None else str(row[col])
-                if c == 0 and (edited_mark or promoted_mark):
+                if col == "csv_path" and (edited_mark or promoted_mark):
                     prefix = ""
                     if promoted_mark:
                         prefix += "^"
@@ -1935,7 +1940,7 @@ class MainWindow(QMainWindow):
                 # surface for what the '^' glyph means.
                 if tip:
                     item.setToolTip(tip)
-                elif c == 0 and promoted_mark and promoted_at:
+                elif col == "csv_path" and promoted_mark and promoted_at:
                     item.setToolTip(f"Promoted to cloud: {promoted_at}")
                 self.table.setItem(r, c, item)
         self.table.blockSignals(False)
@@ -1957,7 +1962,7 @@ class MainWindow(QMainWindow):
         so on_save_edits/on_save_and_exit is the only path that reaches SQLite.
         """
         row = item.row()
-        col = VISIBLE_COLUMNS[item.column()]
+        col = STAGING_COLUMNS[item.column()]
         # Canonicalize defensively -- rows from the DB are already canonical,
         # but if anything ever bypasses that, this keeps the pending key in
         # sync with the row it must UPDATE.
@@ -1979,7 +1984,7 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(True)
         try:
             for r in range(self.table.rowCount()):
-                for c, col in enumerate(VISIBLE_COLUMNS):
+                for c, col in enumerate(STAGING_COLUMNS):
                     item = self.table.item(r, c)
                     if item is None:
                         continue
