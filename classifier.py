@@ -30,20 +30,21 @@ Un-computable data (empty/short arrays, NaN/inf, a flat UV with no dynamic range
 or a window with no samples) yields a result with empty metrics and a note rather
 than raising; the human still sees the record (grey/unreviewed in Phase B).
 
-The CD analysis window is data-driven by default, but a per-record manual_window
-override (set visually in Phase B and persisted on the cloud doc) REPLACES it
-when present; UV detection and the UV ratio gate are unaffected. The window
-actually used is recorded on every result (window_used / window_source) so a
-stored metrics result always carries the window it was computed under.
+The CD analysis window is the per-record manual_window when one is set (chosen
+visually in Phase B and persisted on the cloud doc), else the global default
+[WINDOW_DEFAULT_MIN, WINDOW_DEFAULT_MAX]. There is NO algorithmic re-derivation:
+the window the CD couplet is read inside is exactly one of those two, and it is
+recorded on every result (window_used / window_source = "manual" | "default") so
+a stored metrics result always carries the window it was computed under.
 
 A "borderline" flag marks results whose UV ratio or lobe ratio sits within
 +/-BORDERLINE_BAND of its threshold so a human knows to eyeball them.
 
 All thresholds / windows below are PROVISIONAL: Jeff will tune the prominence
-ratio `k` (UV_PROMINENCE_RATIO) and the right-edge fraction `f`
-(BAND2_RIGHT_FRACTION) VISUALLY in Phase B. Because the persisted computed_metrics
-block is a CACHE derived from these provisional constants AND the window used, the
-measure+write pass is kept idempotent / safely re-runnable after any retune.
+ratio `k` (UV_PROMINENCE_RATIO) and the default window VISUALLY in Phase B.
+Because the persisted computed_metrics block is a CACHE derived from these
+provisional constants AND the window used, the measure+write pass is kept
+idempotent / safely re-runnable after any retune.
 
 Dependencies: numpy + scipy.signal.find_peaks (prominence-based peak detection
 on the raw curve -- prominence, not absolute height, is what separates real
@@ -62,7 +63,7 @@ from scipy.signal import find_peaks
 
 
 # ===========================================================================
-# TUNABLE CONSTANTS  (PROVISIONAL -- Jeff tunes k and f visually in Phase B)
+# TUNABLE CONSTANTS  (PROVISIONAL -- Jeff tunes k visually in Phase B)
 # ===========================================================================
 UV_PEAK_SEARCH_MIN = 300.0      # nm, region to look for the two UV bands
 UV_PEAK_SEARCH_MAX = 600.0      # nm
@@ -73,10 +74,8 @@ UV_PEAK_SEARCH_MAX = 600.0      # nm
 # absolute height) is what separates real bands from ripple without smoothing.
 UV_PROMINENCE_RATIO = 0.05
 
-# f: right edge = where band 2 has decayed to f of its peak-above-baseline.
-BAND2_RIGHT_FRACTION = 0.15
-
-# Far-red flat tail used to estimate the UV baseline.
+# Far-red flat tail used to estimate the UV baseline (DISPLAY-ONLY now -- it no
+# longer feeds the ratio gate or any window edge).
 BASELINE_TAIL_MIN = 650.0       # nm
 BASELINE_TAIL_MAX = 700.0       # nm
 
@@ -86,11 +85,10 @@ LOBE_RATIO_THRESHOLD = 0.50     # smaller-lobe/larger-lobe evolution gate
 # +/- band around each threshold -> flag for review (does NOT change the label).
 BORDERLINE_BAND = 0.05
 
-# Nominal CD analysis window. This is the FALLBACK SEED for the Phase B window
-# slider when a record has NO manual_window -- it does NOT drive classification
-# on its own: a record with no manual_window is classified under the DATA-DRIVEN
-# window (inter-band valley -> band-2 decay). A per-record manual_window, when
-# set, overrides the data-driven window. (Provisional.)
+# The CD analysis window when a record has NO manual_window: the SINGLE source of
+# truth for the default window. The CD couplet IS measured inside it -- there is
+# NO algorithmic re-derivation. A per-record manual_window, when set, replaces
+# it. (Provisional.)
 WINDOW_DEFAULT_MIN = 450.0      # nm
 WINDOW_DEFAULT_MAX = 500.0      # nm
 
@@ -150,10 +148,9 @@ class ClassificationResult:
     uv_baseline: Optional[float] = None              # display-only (far-red tail)
     uv_peak1: Point = field(default_factory=Point)   # shorter-lambda band
     uv_peak2: Point = field(default_factory=Point)   # longer-lambda band
-    interband_valley_lambda: Optional[float] = None  # = window LEFT edge (auto)
     window_left: Optional[float] = None
     window_right: Optional[float] = None
-    window_source: Optional[str] = None              # "manual" | "data-driven"
+    window_source: Optional[str] = None              # "manual" | "default"
     uv_two_peak_ratio: Optional[float] = None        # p2/p1 (raw, no baseline)
 
     # --- CD evidence (inside the window) ---
@@ -261,12 +258,12 @@ def _near(value: Optional[float], threshold: float) -> bool:
 
 def _resolve_manual_window(manual_window) -> Optional[tuple]:
     """Normalize a per-record manual window override to (lo, hi) floats, or None
-    when absent / malformed (-> caller uses the data-driven window instead).
+    when absent / malformed (-> caller uses the global default window instead).
 
     Accepts a {"min_nm", "max_nm"} dict (as persisted on the cloud doc) or a
     plain (lo, hi) pair. A non-numeric, non-finite, or non-increasing window is
     treated as "no override" rather than an error, so a bad stored value can
-    never break classification -- it just falls back to the data-driven window.
+    never break classification -- it just falls back to the default window.
     """
     if manual_window is None:
         return None
@@ -298,10 +295,10 @@ def classify_arrays(wavelength, cd, uv,
     raising.
 
     `manual_window` is an optional per-record override of the CD analysis window
-    ({"min_nm", "max_nm"} dict or (lo, hi) pair). When present and valid it
-    REPLACES the data-driven window (the CD couplet is read inside it); UV band
-    detection and the UV peak2/peak1 ratio gate are UNAFFECTED. When
-    absent/malformed the window is data-driven exactly as before.
+    ({"min_nm", "max_nm"} dict or (lo, hi) pair). When present and valid the CD
+    couplet is read inside it; otherwise it is read inside the global default
+    window [WINDOW_DEFAULT_MIN, WINDOW_DEFAULT_MAX]. UV band detection and the UV
+    peak2/peak1 ratio gate are UNAFFECTED by the window.
     """
     prepared = _prepare(wavelength, cd, uv)
     if prepared is None:
@@ -359,47 +356,24 @@ def classify_arrays(wavelength, cd, uv,
     peak1 = Point(float(wl_w[i1]), float(uv_w[i1]))
     peak2 = Point(float(wl_w[i2]), float(uv_w[i2]))
 
-    # Band-2 height above baseline -- used ONLY by the data-driven RIGHT edge
-    # (decay to a fraction of this). The UV ratio gate uses RAW peak values, so
-    # the baseline no longer feeds the ratio (it stays for display + this edge).
-    peak2_height = float(uv_w[i2]) - baseline
-
     # --- step 3: resolve the CD analysis window [LEFT, RIGHT] ---------------
-    # A per-record manual_window OVERRIDES the data-driven derivation; with none
-    # the window is DATA-DRIVEN (inter-band valley LEFT, band-2 decay RIGHT) as
-    # before. Either way the CD couplet (steps 4-7) is read inside [left, right].
+    # SINGLE source of truth: the per-record manual_window when set, else the
+    # global default [WINDOW_DEFAULT_MIN, WINDOW_DEFAULT_MAX]. There is NO
+    # algorithmic re-derivation -- the CD couplet (step 4 on) is read inside
+    # exactly this [left, right], and it is the window stored on the result.
     mw = _resolve_manual_window(manual_window)
     if mw is not None:
         left, right = mw
-        interband_valley = None              # no data-driven valley in this mode
         window_source = "manual"
     else:
-        # LEFT = inter-band valley: lambda of the UV minimum between the two
-        # bands. This is what excludes band-1's CD feature (e.g. a ~345 nm dip).
-        seg = uv_w[i1:i2 + 1]
-        valley_i = i1 + int(np.argmin(seg))
-        left = float(wl_w[valley_i])
-        interband_valley = left
-        # RIGHT = walking from peak2 toward LONGER lambda (in the full sorted
-        # array, since the decay can run past UV_PEAK_SEARCH_MAX), the first
-        # wavelength where (uv - baseline) has fallen to f of band-2's height.
-        right_threshold = BAND2_RIGHT_FRACTION * peak2_height
-        start = int(np.searchsorted(wl, peak2.wl, side="right"))
-        right = None
-        for k in range(start, wl.size):
-            if (float(uvv[k]) - baseline) <= right_threshold:
-                right = float(wl[k])
-                break
-        if right is None:
-            right = float(wl[-1])            # never decayed -> clamp to far edge
-        window_source = "data-driven"
+        left, right = WINDOW_DEFAULT_MIN, WINDOW_DEFAULT_MAX
+        window_source = "default"
 
     # --- CD samples inside the window (a missing window is un-computable) ----
     inwin = (wl >= left) & (wl <= right)
     common = dict(
         uv_baseline=baseline,
         uv_peak1=peak1, uv_peak2=peak2,
-        interband_valley_lambda=interband_valley,
         window_left=left, window_right=right,
         window_source=window_source,
     )
@@ -487,8 +461,8 @@ def classify_record(rec: dict) -> ClassificationResult:
 
     Reads the `wavelength` / `cd` / `uv` arrays stored by
     mongo_db.promote_records, plus an optional per-record `manual_window`
-    override ({"min_nm", "max_nm"}) that, when present, replaces the data-driven
-    CD analysis window. Read-only -- the document is never modified.
+    override ({"min_nm", "max_nm"}) that, when present, replaces the global
+    default CD analysis window. Read-only -- the document is never modified.
     """
     return classify_arrays(
         rec.get("wavelength"), rec.get("cd"), rec.get("uv"),
@@ -502,13 +476,13 @@ def thresholds_snapshot() -> dict:
     """The PROVISIONAL tuning constants as a plain dict, sourced straight from
     the module-level constants above (never duplicate the numbers elsewhere --
     read them from here). Embedded in every computed_metrics cache doc so a later
-    pass can detect that k/f or any threshold changed and the cache is stale, and
+    pass can detect that k or any threshold changed and the cache is stale, and
     re-run the (idempotent) measure+write pass.
     """
     return {
         "uv_peak_search_nm": [UV_PEAK_SEARCH_MIN, UV_PEAK_SEARCH_MAX],
         "uv_prominence_ratio": UV_PROMINENCE_RATIO,
-        "band2_right_fraction": BAND2_RIGHT_FRACTION,
+        "default_window_nm": [WINDOW_DEFAULT_MIN, WINDOW_DEFAULT_MAX],
         "baseline_tail_nm": [BASELINE_TAIL_MIN, BASELINE_TAIL_MAX],
         "uv_ratio_threshold": UV_RATIO_THRESHOLD,
         "lobe_ratio_threshold": LOBE_RATIO_THRESHOLD,
@@ -543,7 +517,6 @@ def computed_metrics_doc(result: ClassificationResult) -> dict:
         "uv_baseline": result.uv_baseline,
         "uv_peak1": _pt(result.uv_peak1),
         "uv_peak2": _pt(result.uv_peak2),
-        "interband_valley_lambda": result.interband_valley_lambda,
         "window_used": [result.window_left, result.window_right],
         "window_source": result.window_source,
         "uv_two_peak_ratio": result.uv_two_peak_ratio,

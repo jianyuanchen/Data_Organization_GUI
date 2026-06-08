@@ -32,9 +32,9 @@ WRITES (the only ones this window performs -- spectra are NEVER touched):
     change, OR when a record's manual_window changes). Writers also $unset the
     legacy `auto_classification` block so old docs migrate.
   - manual_window       : per-record CD analysis window {min_nm, max_nm} set via
-    the dual-handle range slider. Overrides the data-driven window. Persisted
+    the dual-handle range slider. Replaces the global default window. Persisted
     TOGETHER with a freshly recomputed computed_metrics (one atomic write via
-    mongo_db.set_manual_window). "Reset to auto" $unsets it.
+    mongo_db.set_manual_window). "Reset to default" $unsets it.
   - human_classification: the reviewer's category (Ladder/Staircase/Unsure +
     timestamp) -- the ONLY category label and the single source of truth for the
     columns and the ladder-% stat. Saved on demand; CLEARED ($unset) on "Clear
@@ -80,15 +80,65 @@ _UNREVIEWED_GREY = QColor("#d3d3d3")   # staging-area gray -- "not yet sorted"
 _CLASSIFIED_GREEN = QColor("#d4edda")  # whole-strip green -- "classified / done"
 
 
-def _human_readable(rec: dict) -> str:
-    """series | polymers | solvent | film -- the short human label for a row."""
-    series = rec.get("series") or "?"
+def _polymer_system(rec: dict) -> str:
+    """The polymer system -- p1, or 'p1+p2' for a two-component blend."""
     p1 = rec.get("p1_name") or "?"
     p2 = rec.get("p2_name")
-    poly = p1 if (not p2 or p2 == "None") else f"{p1}+{p2}"
-    solvent = rec.get("solvent") or "?"
-    film = rec.get("film_state") or "?"
-    return f"{series} | {poly} | {solvent} | {film}"
+    return p1 if (not p2 or p2 == "None") else f"{p1}+{p2}"
+
+
+def _num_str(x) -> str:
+    """A numeric metadata value as a clean string ('' when blank). Drops a
+    trailing '.0' so conc/anneal_temp read as 20 / 160, not 20.0 / 160.0."""
+    if x is None or x == "" or x == "None" or isinstance(x, bool):
+        return ""
+    if isinstance(x, (int, float)):
+        return str(int(x)) if float(x).is_integer() else str(x)
+    return str(x).strip()
+
+
+def _record_label(rec: dict) -> str:
+    """Metadata-rich entry label, segments joined by ' | ':
+
+        components | ratio | conc+solvent | anneal
+
+    Built ONLY from fields already on the record (no computation). Empty segments
+    are dropped so singles don't show '| |' gaps (e.g. 'R-F8BT | 20CB | AN160').
+    """
+    segments = []
+
+    # components: p1, or 'p1+p2' for a real two-component blend. n_components is
+    # authoritative for "single"; a blank/'None' p2 means the same.
+    p1 = (rec.get("p1_name") or "").strip()
+    p2 = (rec.get("p2_name") or "").strip()
+    single = (rec.get("n_components") == 1) or (not p2) or (p2 == "None")
+    components = p1 if single else f"{p1}+{p2}"
+    if components:
+        segments.append(components)
+
+    # ratio (e.g. '10x90'); omitted for singles / blank.
+    ratio = (rec.get("ratio") or "").strip()
+    if ratio and ratio != "None":
+        segments.append(ratio)
+
+    # conc+solvent concatenated, no space (20 + 'CB' -> '20CB'); omit if no conc.
+    conc = _num_str(rec.get("conc"))
+    if conc:
+        solvent = (rec.get("solvent") or "").strip()
+        if solvent == "None":
+            solvent = ""
+        segments.append(f"{conc}{solvent}")
+
+    # anneal keyed off film_state (authoritative): AN+temp, or plain AP.
+    fs = (rec.get("film_state") or "").strip()
+    if fs == "AN":
+        segments.append("AN" + _num_str(rec.get("anneal_temp")))
+    elif fs == "AP":
+        segments.append("AP")          # ignore anneal_temp -> never 'AP160'
+    elif fs:
+        segments.append(fs)
+
+    return " | ".join(segments) if segments else "(no metadata)"
 
 
 def _human_label(rec: dict):
@@ -382,6 +432,10 @@ class CDReviewWindow(QDialog):
                     self.staircase_list, self.flagged_list):
             lst.setSelectionMode(
                 QAbstractItemView.SelectionMode.SingleSelection)
+            # Over-long labels truncate from the RIGHT with an ellipsis (the full
+            # label is on hover via the item tooltip); no mid-row wrapping.
+            lst.setTextElideMode(Qt.TextElideMode.ElideRight)
+            lst.setWordWrap(False)
             lst.itemClicked.connect(self._on_item_clicked)
             self._lists.append(lst)
 
@@ -476,9 +530,9 @@ class CDReviewWindow(QDialog):
         self.win_max_lbl.setStyleSheet("font-weight:bold;")
         srow.addWidget(QLabel("max"))
         srow.addWidget(self.win_max_lbl)
-        self.reset_window_btn = QPushButton("Reset to auto")
+        self.reset_window_btn = QPushButton("Reset to default")
         self.reset_window_btn.setToolTip(
-            "Clear this record's manual window and revert to the data-driven "
+            "Clear this record's manual window and revert to the default CD "
             "window (re-saves the refreshed metrics cache).")
         self.reset_window_btn.clicked.connect(self._on_reset_window)
         srow.addWidget(self.reset_window_btn)
@@ -602,25 +656,35 @@ class CDReviewWindow(QDialog):
         self.ladder_box.setTitle(f"LADDER  ({n_ladder})")
         self.staircase_box.setTitle(f"STAIRCASE  ({n_stair})")
         self.flagged_box.setTitle(f"FLAGGED / unsure + bad data  ({n_flag})")
-        # Ladder % is a fraction of REVIEWED records (honest denominator); it
-        # starts at 0 and the total is shown so progress is visible.
+        # Honest denominators: ladder as a fraction of REVIEWED, then the raw
+        # not-done / total / borderline counts.
         pct = (100.0 * n_ladder / n_reviewed) if n_reviewed else 0.0
         n_border = sum(1 for r in self.results if r.borderline)
         self.pct_label.setText(
-            f"Ladder {n_ladder} / reviewed {n_reviewed} / total {total}  "
-            f"·  {pct:.1f}% of reviewed  ·  not done {n_notdone}  "
-            f"·  borderline {n_border}")
+            f"Ladder {n_ladder} of {n_reviewed} reviewed ({pct:.0f}%)  "
+            f"·  {n_notdone} not done  ·  {total} total  "
+            f"·  {n_border} borderline")
 
     def _make_item(self, idx: int, rec: dict, res) -> QListWidgetItem:
         item = QListWidgetItem(self._item_text(rec, res))
         item.setData(Qt.ItemDataRole.UserRole, idx)
         item.setBackground(QBrush(self._item_brush(rec)))
-        item.setToolTip(rec.get("filename") or rec.get("record_id") or "")
+        # The FULL label (untruncated) plus the hex record_id and filename live
+        # in the tooltip, so a row elided to fit the column is still readable on
+        # hover and the record_id stays available as the join key.
+        rid = rec.get("record_id") or "(no id)"
+        fname = rec.get("filename") or ""
+        tip = f"{_record_label(rec)}\nrecord_id: {rid}"
+        if fname:
+            tip += f"\nfile: {fname}"
+        item.setToolTip(tip)
         return item
 
     def _item_text(self, rec: dict, res) -> str:
-        rid = rec.get("record_id") or ""
-        short = rid.split("-")[0] if rid else "(no id)"
+        # Lead with the metadata-rich label (components | ratio | conc+solvent |
+        # anneal) -- same everywhere. The hex record_id / series are NOT shown
+        # inline; the full label + id live in the tooltip (set in _make_item).
+        lead = _record_label(rec)
         badges = []
         h = _human_label(rec)
         if h:
@@ -633,7 +697,7 @@ class CDReviewWindow(QDialog):
         if classifier._resolve_manual_window(rec.get("manual_window")) is not None:
             badges.append("✎ win")
         tail = ("  [" + " · ".join(badges) + "]") if badges else ""
-        return f"{short} | {_human_readable(rec)}{tail}"
+        return f"{lead}{tail}"
 
     def _item_brush(self, rec: dict) -> QColor:
         # Lifecycle: grey (unreviewed) -> whole-strip green on classification.
@@ -693,10 +757,18 @@ class CDReviewWindow(QDialog):
         rec, res = self.records[idx], self.results[idx]
         rid = rec.get("record_id") or "(no id)"
         fname = rec.get("filename") or ""
-        self.detail_header.setText(
-            f"<b>Record {idx + 1} of {len(self.records)}</b> &nbsp;|&nbsp; "
-            f"<code>{rid}</code>"
-            + (f" &nbsp;|&nbsp; {fname}" if fname else ""))
+        # Lead with the human identity; keep the title to ONE line by truncating
+        # a long filename (full filename + record_id available on hover).
+        series = rec.get("series") or "?"
+        head = (f"<b>Record {idx + 1} of {len(self.records)}</b> "
+                f"&nbsp;·&nbsp; {series} · {_polymer_system(rec)}")
+        if fname:
+            fdisp = fname if len(fname) <= 44 else fname[:43] + "…"
+            head += (f" &nbsp;·&nbsp; <span style='color:#555;"
+                     f"font-size:11px;'>{fdisp}</span>")
+        self.detail_header.setText(head)
+        self.detail_header.setToolTip(
+            f"record_id: {rid}" + (f"\nfile: {fname}" if fname else ""))
         self.metrics_label.setText(self._metrics_html(rec, res))
         self._seed_window_slider(rec)
         self._draw_detail_plots(idx)
@@ -725,18 +797,17 @@ class CDReviewWindow(QDialog):
                   "border-radius:3px;'>BORDERLINE: "
                   f"{', '.join(res.borderline_flags)}</span>")
 
-        # CD window line reflects the MANUAL-selection model: show the saved
-        # manual window, else "(default)" (the global default seed) when the
-        # record has no manual_window of its own.
-        mw = classifier._resolve_manual_window(rec.get("manual_window"))
-        if mw is not None:
-            cd_window = (f"CD window <span style='color:#7a5c00;"
-                         f"font-weight:bold;'>(manual)</span>: "
-                         f"<b>[{_wl(mw[0])} … {_wl(mw[1])}]</b>")
+        # CD window line: the SINGLE window the metrics were computed under
+        # (res.window_*), labelled manual vs default from res.window_source --
+        # the SAME values the status line and the plotted markers read.
+        if res.window_left is not None and res.window_source:
+            src = res.window_source            # "manual" | "default"
+            colour = "#7a5c00" if src == "manual" else "#444"
+            cd_window = (f"CD window <span style='color:{colour};"
+                         f"font-weight:bold;'>({src})</span>: "
+                         f"<b>[{_wl(res.window_left)} … {_wl(res.window_right)}]</b>")
         else:
-            cd_window = (f"CD window <b>(default)</b>: "
-                         f"[{_wl(classifier.WINDOW_DEFAULT_MIN)} … "
-                         f"{_wl(classifier.WINDOW_DEFAULT_MAX)}]")
+            cd_window = "CD window: <b>— (not measured)</b>"
 
         uv_ratio_metric = (f"peak2/peak1 (raw) = "
                            f"<b>{_f(res.uv_two_peak_ratio, 2)}</b> "
@@ -750,6 +821,15 @@ class CDReviewWindow(QDialog):
                       if human else
                       "<span style='color:#777;'>unreviewed</span>")
 
+        # Couplet cue: when a couplet IS present but a peak-ratio gate fails, say
+        # so explicitly so "yes" doesn't read as contradictory above failed gates.
+        if res.bisignate:
+            evolved = res.gates.uv_ratio_pass and res.gates.lobe_ratio_pass
+            couplet_txt = ("yes" if evolved
+                           else "yes — couplet present (not yet evolved)")
+        else:
+            couplet_txt = "no"
+
         notes = res.notes or "—"
 
         return f"""
@@ -757,15 +837,13 @@ class CDReviewWindow(QDialog):
         <h3 style='margin:2px 0;'>Computed metrics
           <span style='font-size:11px;color:#777;'>(no verdict — you decide)</span>{bl}</h3>
         <div style='color:#444;'>your classification: {human_line}
-          &nbsp;·&nbsp; bisignate couplet:
-          <b>{'yes' if res.bisignate else 'no'}</b></div>
+          &nbsp;·&nbsp; bisignate couplet: <b>{couplet_txt}</b></div>
         <hr>
         <b>UV bands ({psmin:.0f}–{psmax:.0f} nm search)</b>
           &nbsp;{chip(g.uv_band_detected, "2 BANDS", "1 BAND")}<br>
         &nbsp;&nbsp;baseline (tail, display-only): <b>{_f(res.uv_baseline)}</b><br>
         &nbsp;&nbsp;peak1 (shorter λ): <b>{_f(res.uv_peak1.value)}</b> @ {_wl(res.uv_peak1.wl)}<br>
         &nbsp;&nbsp;peak2 (longer λ): <b>{_f(res.uv_peak2.value)}</b> @ {_wl(res.uv_peak2.wl)}<br>
-        &nbsp;&nbsp;inter-band valley: {_wl(res.interband_valley_lambda)}<br>
         &nbsp;&nbsp;{cd_window}<br>
         <br>
         <b>UV peak ratio</b> &nbsp;{chip(g.uv_ratio_pass)}<br>
@@ -861,8 +939,7 @@ class CDReviewWindow(QDialog):
                 (res.crossover_wavelength, 0.0), textcoords="offset points",
                 xytext=(4, 4), fontsize=8, color="#6f42c1", zorder=7)
 
-        # --- UV: draw the baseline, mark peak1/peak2, and the inter-band
-        # valley (the window's left edge). ---
+        # --- UV: draw the baseline and mark peak1 / peak2. ---
         if res.uv_baseline is not None:
             self.ax_uv.axhline(res.uv_baseline, color="#999999",
                                linestyle=":", linewidth=1.0, zorder=1)
@@ -873,9 +950,6 @@ class CDReviewWindow(QDialog):
         if p2.wl is not None and p2.value is not None:
             self._mark(self.ax_uv, p2.wl, p2.value, "s",
                        "#9467bd", f"peak2 {p2.wl:.0f}nm")
-        if res.interband_valley_lambda is not None:
-            self.ax_uv.axvline(res.interband_valley_lambda, color="#fd7e14",
-                               linestyle="--", linewidth=1.0, zorder=4)
 
         self._draw_axes_chrome()
         self.toolbar.update()      # reset zoom/pan history for the new record
@@ -910,23 +984,18 @@ class CDReviewWindow(QDialog):
         mw = classifier._resolve_manual_window(rec.get("manual_window"))
         if mw is not None:
             self.window_status.setText(
-                f"<b>Manual window ACTIVE</b> — {mw[0]:.0f}–{mw[1]:.0f} nm "
-                f"overrides the auto window. Drag to adjust, or "
-                f"<i>Reset to auto</i>.")
+                f"<b>Manual window</b> {mw[0]:.0f}–{mw[1]:.0f} nm. Drag the "
+                f"handles to adjust, or <i>Reset to default</i>.")
         elif res.window_left is not None:
             self.window_status.setText(
-                f"No manual window — measured under the <b>auto "
-                f"(data-driven)</b> window "
-                f"{res.window_left:.0f}–{res.window_right:.0f} nm. Slider shows "
-                f"the default "
-                f"{classifier.WINDOW_DEFAULT_MIN:.0f}–"
-                f"{classifier.WINDOW_DEFAULT_MAX:.0f} nm; drag + release to set "
-                f"a manual window for this record.")
+                f"No manual window set — measured under the <b>default</b> "
+                f"{res.window_left:.0f}–{res.window_right:.0f} nm. Drag the "
+                f"handles to set one for this record.")
         else:
             self.window_status.setText(
-                "No manual window. The auto window is unavailable for this "
-                "record (un-computable / single UV band). Drag + release to "
-                "force a manual CD window.")
+                "No manual window set. This record has no measurable CD window "
+                "(un-computable / single UV band). Drag the handles to set "
+                "one.")
 
     def _on_window_dragged(self, lo: float, hi: float):
         """Live during a handle drag: update the nm readouts and redraw the
@@ -960,14 +1029,14 @@ class CDReviewWindow(QDialog):
         self._persist_window(rec.get("record_id"), mw, metrics)
 
     def _on_reset_window(self):
-        """Clear this record's manual_window (revert to the data-driven window),
+        """Clear this record's manual_window (revert to the default window),
         re-measure, and persist the cleared field + refreshed cache together."""
         if not (0 <= self.current_index < len(self.records)):
             return
         idx = self.current_index
         rec = self.records[idx]
         rec.pop("manual_window", None)                  # mirror clear locally
-        res = classifier.classify_record(rec)           # data-driven again
+        res = classifier.classify_record(rec)           # default window again
         self.results[idx] = res
         metrics = classifier.computed_metrics_doc(res)
         rec["computed_metrics"] = metrics

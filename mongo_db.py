@@ -844,7 +844,7 @@ def set_manual_window(record_id, manual_window, metrics_doc, log=print) -> dict:
     re-measures under the new window and hands us both:
 
       - `manual_window`: a {"min_nm", "max_nm"} dict to SET, or None to CLEAR
-        (revert the record to the data-driven window). Clearing $unsets the
+        (revert the record to the global default window). Clearing $unsets the
         field so it disappears from the doc rather than lingering as null.
       - `metrics_doc`: the refreshed classifier.computed_metrics_doc(result),
         always $set so the stored cache matches the window just chosen.
@@ -873,7 +873,7 @@ def set_manual_window(record_id, manual_window, metrics_doc, log=print) -> dict:
                     "$unset": {"auto_classification": ""}}
     if manual_window is None:
         update["$unset"]["manual_window"] = ""
-        action = "cleared (reverted to data-driven)"
+        action = "cleared (reverted to default)"
     else:
         update["$set"]["manual_window"] = manual_window
         action = (f"set [{manual_window.get('min_nm')}-"
