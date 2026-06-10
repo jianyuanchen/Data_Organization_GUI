@@ -66,6 +66,12 @@ class Meta:
     peak_cd_wl: Optional[int] = None
     peak_uv: Optional[float] = None
     peak_uv_wl: Optional[int] = None
+    # Dopant metadata. Only the manifest ingest path supplies these (the
+    # filename convention never encoded dopants), so regex-parsed rows carry
+    # None in both. Optional[str]/Optional[float] like the other nullable
+    # fields; blank dopant == undoped film.
+    dopant: Optional[str] = None
+    dopant_conc: Optional[float] = None
     # ---- forward-looking metadata (stored, not yet used by any logic) -------
     # Stable per-record id. Independent of csv_path so it survives file moves
     # and is the durable hook for future MongoDB / vector-DB integrations.
@@ -150,4 +156,9 @@ REVIEW_STATUS_COLORS = {
     "rejected":   "#f8d7da",   # light pink / red
     "needs_work": "#ffe5b4",   # peach -- distinct from #fff3cd pending-edit yellow
     "unparsed":   "#d3d3d3",   # light gray -- "needs renaming, not in review flow"
+    # Manifest-ingest flag: row staged fine but carries a validation warning
+    # (folder/row conflict, derived-field mismatch, human-overridden review).
+    # Deeper amber than needs_work's peach and the pending-edit yellow so all
+    # three stay tellable at a glance. Reviewable + confirmable like pending.
+    "needs_review": "#ffd966",
 }

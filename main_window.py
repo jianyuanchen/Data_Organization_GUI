@@ -413,6 +413,10 @@ class MainWindow(QMainWindow):
         # Single read-only CloudBrowserWindow instance, same lifecycle as the
         # verification window (kept alive non-modally; re-clicks raise it).
         self._cloud_browser_win = None
+        # Single ImportWindow (manifest ingest path) instance, same non-modal
+        # lifecycle. Confirmed rows land in SQLite staging via the same
+        # writer as Browse, so everything downstream is shared.
+        self._import_win = None
         # Single CDReviewWindow (Phase B classifier review) instance, same
         # non-modal lifecycle. Reads verified cloud records; its only cloud
         # writes are the additive auto_/human_classification tags.
@@ -513,6 +517,14 @@ class MainWindow(QMainWindow):
         self.path_field.setPlaceholderText("No folder selected")
         browse = QPushButton("Browse...")
         browse.clicked.connect(self.on_browse)
+        import_manifest = QPushButton("Import Manifest")
+        import_manifest.setToolTip(
+            "Open the manifest import window: load a Cowork-generated "
+            "manifest.csv (or a folder containing one), verify/fix the "
+            "parsed metadata, then confirm rows into the staging table. "
+            "Filenames keep their bench names -- the manifest carries the "
+            "metadata.")
+        import_manifest.clicked.connect(self.on_import_manifest)
         prune = QPushButton("Prune Missing")
         prune.setToolTip(
             "Delete database rows whose CSV files no longer exist on disk.")
@@ -583,6 +595,7 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("Folder:"))
         h.addWidget(self.path_field, stretch=1)
         h.addWidget(browse)
+        h.addWidget(import_manifest)
         h.addWidget(prune)
         h.addWidget(review)
         h.addWidget(self.promote_batch_btn)
@@ -958,6 +971,60 @@ class MainWindow(QMainWindow):
         self._refresh_view_options()
         self.refresh_filter_options()
         self.refresh_table()
+
+    def on_import_manifest(self):
+        """Open the manifest import window (the second ingest front-end).
+
+        Same single-instance, non-modal lifecycle as the verification /
+        cloud-browser windows. The window validates and displays the
+        manifest's metadata; on Confirm it stages rows through the same
+        SQLite writer as Browse and emits `ingested(batch_id)`, which we
+        treat exactly like a finished browse (adopt the batch as the active
+        view + refresh).
+        """
+        if not self._guard_pending():
+            return
+        if (self._import_win is not None
+                and self._import_win.isVisible()):
+            self._import_win.raise_()
+            self._import_win.activateWindow()
+            self.log("Import window already open; raised to front.")
+            return
+
+        # Lazy import like the other tool windows, so a problem in the
+        # manifest path (e.g. missing dotenv for config) surfaces as a log
+        # line instead of breaking app launch.
+        try:
+            from import_window import ImportWindow
+        except Exception as e:
+            self.log(
+                f"Failed to open import window: {type(e).__name__}: {e}")
+            self.log(traceback.format_exc())
+            return
+
+        self._import_win = ImportWindow(
+            self.db, batch_id_factory=new_batch_id, log=self.log,
+            parent=self)
+        self._import_win.ingested.connect(self._after_manifest_ingest)
+        self._import_win.finished.connect(
+            lambda *_args: self._after_import_window())
+        self._import_win.show()
+        self.log("Opened manifest import window.")
+
+    def _after_manifest_ingest(self, batch_id: str):
+        """Rows from the import window just landed in SQLite. Adopt the new
+        batch as the active view (mirrors the end of on_browse) and refresh
+        everything that reads the scans table."""
+        self.latest_batch_id = batch_id
+        self._active_view = batch_id
+        self._refresh_view_options()
+        self.refresh_filter_options()
+        self.refresh_table()
+
+    def _after_import_window(self):
+        """Drop the cached import-window reference on close so the next
+        click builds a fresh window."""
+        self._import_win = None
 
     def on_prune_missing(self):
         """Full-DB sweep for orphan rows. Honors the unsaved-changes guard so

@@ -4,6 +4,8 @@ and the three upsert flavors. Source of truth for parsed scan metadata.
 """
 from __future__ import annotations
 
+import getpass
+import json
 import os
 import sqlite3
 import uuid
@@ -19,13 +21,40 @@ DB_PATH = "cd_metadata.db"
 _TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
               "p1_hand", "p2_name", "p2_backbone", "p2_chirality", "p2_hand",
               "config", "ratio", "solvent", "film_state",
+              # dopant metadata (manifest path only; regex rows carry NULL)
+              "dopant",
               # forward-looking metadata
               "record_id", "flags", "verified_date", "added_by",
               # batch + verification state
               "batch_id", "review_status",
               # parse diagnostic (only set on review_status='unparsed' rows)
               "parse_error"}
-_REAL_COLS = {"speed_mm_s", "peak_g", "peak_wl", "peak_cd", "peak_uv"}
+_REAL_COLS = {"speed_mm_s", "peak_g", "peak_wl", "peak_cd", "peak_uv",
+              "dopant_conc"}
+
+# Manifest-ingest extras. Live on every scans row but are NOT part of
+# COLUMNS / Meta -- same pattern as `edited` / `promoted`: managed only by
+# ingest_manifest_record, invisible to the staging table and the upsert
+# flavors, and therefore zero-impact on the regex path and everything
+# downstream (verification window, promote-to-cloud).
+#   arrays_json            embedded spectral arrays {wavelength,g,cd,uv}
+#   data_hash              SHA-256 tripwire over the embedded arrays
+#   source_folder          provenance string from the manifest row
+#   manifest_version       manifest schema version that produced the row
+#   manifest_generated_at  Cowork's ISO timestamp for the manifest
+#   manifest_peak_g/_wl    the manifest's CHECKSUM peak values (provenance
+#                          only -- peak_g/peak_wl hold the computed truth)
+#   ingest_source          'manifest' (NULL on regex-path rows)
+_MANIFEST_EXTRA_COLS = (
+    ("arrays_json", "TEXT"),
+    ("data_hash", "TEXT"),
+    ("source_folder", "TEXT"),
+    ("manifest_version", "TEXT"),
+    ("manifest_generated_at", "TEXT"),
+    ("manifest_peak_g", "REAL"),
+    ("manifest_peak_wl", "REAL"),
+    ("ingest_source", "TEXT"),
+)
 
 
 def _sqltype(col: str) -> str:
@@ -85,6 +114,14 @@ class DB:
                 "ALTER TABLE scans ADD COLUMN promoted_at TEXT")
         except sqlite3.OperationalError:
             pass
+        # Manifest-ingest extras (see _MANIFEST_EXTRA_COLS). Same idempotent
+        # ALTER TABLE migration pattern as edited/promoted above.
+        for col, sqltype in _MANIFEST_EXTRA_COLS:
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE scans ADD COLUMN {col} {sqltype}")
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
 
         # One-time (per-startup, but idempotent) migrations. Stash counts so
@@ -468,3 +505,181 @@ class DB:
             f"UPDATE scans SET {', '.join(sets)} WHERE csv_path=?",
             vals + [csv_path])
         self.conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Manifest Confirm -> SQLite ingest (the ONLY place manifest-path CSVs are
+# read). manifest.py validated the metadata and built the Meta; this function
+# loads the spectral arrays, embeds them, computes the authoritative peak
+# values, cross-checks the manifest's checksum peaks, and lands everything
+# through the SAME staging writer the regex path uses
+# (upsert_preserving_edits), so verification + promote flows are untouched.
+# ---------------------------------------------------------------------------
+
+# Mirrors plotting.ROW_LIMIT for the fallback reader below.
+_SPECTRA_ROW_LIMIT = 801
+
+
+def _read_spectra(path: str) -> list[list[float]]:
+    """[wavelength, g, cd, uv] float lists for a data CSV.
+
+    Prefers plotting.read_csv_columns (the canonical reader, shared with the
+    verification window and promote). plotting imports originpro at module
+    level, so on a machine without Origin we fall back to an equivalent
+    inline reader -- same parsing rules (tab->comma, numeric rows only,
+    ROW_LIMIT cap), so the embedded arrays and data_hash are identical
+    either way. Raises ValueError when no numeric rows are found.
+    """
+    try:
+        from plotting import read_csv_columns
+        cols = read_csv_columns(path)
+    except ImportError:
+        rows = []
+        with open(path, encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                parts = line.replace("\t", ",").split(",")
+                try:
+                    rows.append([float(parts[i]) for i in range(4)])
+                except (ValueError, IndexError):
+                    continue
+                if len(rows) == _SPECTRA_ROW_LIMIT:
+                    break
+        cols = [list(col) for col in zip(*rows)] if rows else []
+    if not cols or len(cols) < 4 or not cols[0]:
+        raise ValueError("no numeric 4-column data rows found")
+    return cols
+
+
+def _peak_from_arrays(wavelength, g) -> tuple[float, float]:
+    """(peak_g, peak_wl) computed from the loaded arrays: the signed g value
+    of largest magnitude and the wavelength it occurs at -- the same quantity
+    the filename convention's gval=/nm tokens record. Non-finite points are
+    skipped; raises ValueError if nothing usable remains."""
+    best_i = None
+    best_mag = -1.0
+    n = min(len(wavelength), len(g))
+    for i in range(n):
+        v = g[i]
+        # NaN fails both comparisons; +/-inf is rejected explicitly.
+        mag = abs(v)
+        if mag != mag or mag == float("inf"):
+            continue
+        if mag > best_mag:
+            best_mag = mag
+            best_i = i
+    if best_i is None:
+        raise ValueError("g array has no finite values")
+    return float(g[best_i]), float(wavelength[best_i])
+
+
+def ingest_manifest_record(db: DB, meta, *, manifest_row: dict,
+                           carried_flags=(), batch_id: Optional[str] = None,
+                           log=print) -> dict:
+    """Stage one confirmed manifest row: arrays + metadata as one record.
+
+    `meta` is manifest.build_metadata's Meta; `manifest_row` is the validated
+    parsed dict (for the checksum peaks + provenance strings);
+    `carried_flags` are needs_review reasons the human chose to confirm
+    anyway -- they ride along in `flags` so the verification window shows
+    why the row is amber.
+
+    Steps (the ingest contract):
+      a. load spectral arrays from meta.csv_path  (the ONLY CSV read)
+      b. embed them in the staging row (arrays_json)
+      c. record_id was minted by the Meta dataclass -- stable from here on
+      d. compute peak g / peak wavelength FROM the arrays
+      e. cross-check the manifest's checksum peaks within tolerance;
+         mismatch flags the record (never blocks)
+      f. the COMPUTED peaks land in peak_g/peak_wl (authoritative); the
+         manifest's stay in manifest_peak_g/_wl as provenance
+      g. data_hash over the embedded arrays (re-read tripwire; same hash
+         the cloud layer uses, so promote dedup behavior is unchanged)
+      h. provenance: added_by, verified=0, source_folder, manifest_version
+
+    Returns {"ok", "result", "reasons", "peak_g", "peak_wl"}; ok=False (with
+    "error") when the CSV could not be read -- nothing is staged then.
+    """
+    # a. Load arrays. A failure here means there is no record to stage:
+    # the manifest path embeds arrays atomically with the metadata.
+    try:
+        wavelength, g, cd, uv = _read_spectra(meta.csv_path)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"could not read spectra: {type(e).__name__}: {e}"}
+
+    reasons = list(carried_flags)
+
+    # d. Computed peaks are the source of truth.
+    try:
+        peak_g, peak_wl = _peak_from_arrays(wavelength, g)
+    except ValueError as e:
+        return {"ok": False, "error": f"could not compute peaks: {e}"}
+
+    # e. Derived-field cross-check against the manifest's checksum values.
+    # config is lazy-imported (it pulls dotenv at module level, and database
+    # must stay importable without it).
+    try:
+        from config import (MANIFEST_PEAK_G_ABS_TOL, MANIFEST_PEAK_G_REL_TOL,
+                            MANIFEST_PEAK_WL_TOL_NM)
+    except Exception:
+        MANIFEST_PEAK_WL_TOL_NM, MANIFEST_PEAK_G_REL_TOL, \
+            MANIFEST_PEAK_G_ABS_TOL = 3.0, 0.05, 1e-3
+    m_g = manifest_row.get("peak_gval")
+    m_wl = manifest_row.get("peak_wl_nm")
+    if m_wl is not None and abs(float(m_wl) - peak_wl) > MANIFEST_PEAK_WL_TOL_NM:
+        reasons.append(f"derived-field mismatch: manifest peak_wl_nm {m_wl} "
+                       f"vs computed {peak_wl:g}")
+    if m_g is not None:
+        tol = max(MANIFEST_PEAK_G_REL_TOL * abs(peak_g),
+                  MANIFEST_PEAK_G_ABS_TOL)
+        if abs(float(m_g) - peak_g) > tol:
+            reasons.append(f"derived-field mismatch: manifest peak_gval {m_g} "
+                           f"vs computed {peak_g:g}")
+
+    # f. + h. Authoritative peaks + provenance onto the Meta before staging.
+    meta.peak_g = peak_g
+    meta.peak_wl = peak_wl
+    meta.flags = json.dumps(reasons) if reasons else ""
+    meta.review_status = "needs_review" if reasons else "pending"
+    meta.verified = 0
+    meta.verified_date = None
+    try:
+        meta.added_by = getpass.getuser()
+    except Exception:
+        meta.added_by = "manifest-import"
+
+    # Same staging writer as the regex path: new rows INSERT with everything
+    # above; existing rows keep their user fields (review_status, flags,
+    # record_id, ...) exactly as a re-browse would.
+    result = db.upsert_preserving_edits(meta, batch_id=batch_id)
+    if result != "new" and reasons:
+        log(f"  note: {os.path.basename(meta.csv_path)} re-ingested with "
+            f"flags (existing review state preserved): {'; '.join(reasons)}")
+
+    # g. Tripwire hash over the embedded arrays. Reuse the cloud layer's
+    # implementation so the local hash always equals the one promote will
+    # compute; if mongo_db can't import (e.g. dotenv missing) we store NULL
+    # rather than inventing a second, divergent hash.
+    data_hash = None
+    try:
+        from mongo_db import compute_data_hash
+        data_hash = compute_data_hash(wavelength, g, cd, uv)
+    except Exception as e:
+        log(f"  (data_hash unavailable: {type(e).__name__}: {e})")
+
+    # b. Embed arrays + manifest provenance. These extras live outside
+    # COLUMNS, so the upsert above never touches them -- written every
+    # ingest (the file is their source of truth even on preserved rows).
+    arrays_json = json.dumps({"wavelength": wavelength, "g": g,
+                              "cd": cd, "uv": uv})
+    db.conn.execute(
+        "UPDATE scans SET arrays_json=?, data_hash=?, source_folder=?, "
+        "manifest_version=?, manifest_generated_at=?, manifest_peak_g=?, "
+        "manifest_peak_wl=?, ingest_source='manifest' WHERE csv_path=?",
+        (arrays_json, data_hash, manifest_row.get("source_folder"),
+         manifest_row.get("manifest_version"),
+         manifest_row.get("generated_at"), m_g, m_wl, meta.csv_path))
+    db.conn.commit()
+
+    return {"ok": True, "result": result, "reasons": reasons,
+            "peak_g": peak_g, "peak_wl": peak_wl}
