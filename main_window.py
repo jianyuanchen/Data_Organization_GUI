@@ -27,12 +27,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QSizePolicy,
     QPushButton, QLabel, QLineEdit, QComboBox, QRadioButton, QButtonGroup,
     QCheckBox, QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
-    QFileDialog, QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu, QDialog,
+    QGroupBox, QFrame, QHeaderView, QMessageBox, QMenu, QDialog,
 )
 
 from models import (COLUMNS, REVIEW_STATUS_COLORS, STAGING_COLUMNS,
                     VISIBLE_COLUMNS, canon_path)
-from parser import parse_filename
 from database import DB
 
 
@@ -401,11 +400,6 @@ class MainWindow(QMainWindow):
         # In-memory buffer of staged edits, keyed by (csv_path, column).
         # Nothing reaches SQLite until on_save_edits / on_save_and_exit runs.
         self.pending_edits: dict[tuple[str, str], str] = {}
-        # Most recent browse batch (a string from new_batch_id). None until
-        # the user actually imports something this session; on_open_verification
-        # falls back to db.latest_batch_id() so the button still works after
-        # a fresh app launch.
-        self.latest_batch_id: str | None = None
         # Single VerificationWindow instance, kept alive so it stays usable
         # non-modally and so re-clicks raise the existing window instead of
         # spawning a stack.
@@ -512,43 +506,30 @@ class MainWindow(QMainWindow):
     def _build_top_bar(self):
         box = QGroupBox("Data Source")
         h = QHBoxLayout(box)
-        self.path_field = QLineEdit()
-        self.path_field.setReadOnly(True)
-        self.path_field.setPlaceholderText("No folder selected")
-        browse = QPushButton("Browse...")
-        browse.clicked.connect(self.on_browse)
-        import_manifest = QPushButton("Import Manifest")
-        import_manifest.setToolTip(
-            "Open the manifest import window: load a Cowork-generated "
-            "manifest.csv (or a folder containing one), verify/fix the "
-            "parsed metadata, then confirm rows into the staging table. "
-            "Filenames keep their bench names -- the manifest carries the "
-            "metadata.")
-        import_manifest.clicked.connect(self.on_import_manifest)
+        # Single Import entry point: opens the manifest import window (pick a
+        # manifest.csv or a folder, or drag-drop, then verify + confirm into
+        # staging). Replaces the old "Browse..." + "Import Manifest" pair --
+        # the manifest flow is now the one ingest front-end in the UI.
+        import_btn = QPushButton("Import")
+        import_btn.setToolTip(
+            "Import data via an AI-generated manifest. Opens the import "
+            "window: pick a manifest.csv or a folder containing one (or "
+            "drag-drop it in), verify/fix the parsed metadata, then confirm "
+            "rows into the staging table. Filenames keep their bench names -- "
+            "the manifest carries the metadata.")
+        import_btn.clicked.connect(self.on_import_manifest)
         prune = QPushButton("Prune Missing")
         prune.setToolTip(
             "Delete database rows whose CSV files no longer exist on disk.")
         prune.clicked.connect(self.on_prune_missing)
-        review = QPushButton("Review Imported Batch")
-        review.setToolTip(
-            "Open the verification window for the most recent batch of "
-            "imported records (or the latest batch in the DB if you haven't "
-            "browsed yet this session).")
-        review.clicked.connect(self.on_open_verification)
         review_sel = QPushButton("Review Selected")
         review_sel.setToolTip(
             "Open the verification window for the rows currently selected "
             "in the staging table (Ctrl/Shift-click to multi-select).")
         review_sel.clicked.connect(self.on_review_selected)
-        # Cloud promote actions. Both go through the confirmed-only filter
-        # in mongo_db.promote_records, so non-confirmed rows in the queue
-        # are skipped + logged rather than pushed.
-        self.promote_batch_btn = QPushButton("Promote Batch to Cloud")
-        self.promote_batch_btn.setToolTip(
-            "Upload all CONFIRMED records in the current batch (or the "
-            "latest batch in the DB) to MongoDB Atlas. Non-confirmed rows "
-            "are skipped and logged.")
-        self.promote_batch_btn.clicked.connect(self.on_promote_batch)
+        # Cloud promote: deliberate select-then-act (no batch-sweep button).
+        # Goes through the confirmed-only filter in mongo_db.promote_records,
+        # so non-confirmed selected rows are skipped + logged, not pushed.
         self.promote_sel_btn = QPushButton("Promote Selected to Cloud")
         self.promote_sel_btn.setToolTip(
             "Upload the CONFIRMED rows among the currently-selected staging "
@@ -592,15 +573,11 @@ class MainWindow(QMainWindow):
             "worklist tracks progress as you classify each one Ladder / "
             "Staircase / Unsure. Spectra are never modified.")
         cd_review.clicked.connect(self.on_open_cd_review)
-        h.addWidget(QLabel("Folder:"))
-        h.addWidget(self.path_field, stretch=1)
-        h.addWidget(browse)
-        h.addWidget(import_manifest)
+        h.addWidget(import_btn)
         h.addWidget(prune)
-        h.addWidget(review)
-        h.addWidget(self.promote_batch_btn)
         h.addWidget(review_sel)
         h.addWidget(self.promote_sel_btn)
+        h.addStretch(1)
         h.addSpacing(20)
         h.addWidget(connect)
         h.addWidget(self.close_origin_btn)
@@ -887,91 +864,6 @@ class MainWindow(QMainWindow):
     def log(self, msg: str):
         self.log_box.append(msg)
 
-    def on_browse(self):
-        if not self._guard_pending():
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Select CSV folder")
-        if not folder:
-            return
-        self.path_field.setText(folder)
-        # One batch_id covers this entire browse. Every file SEEN in the
-        # folder gets re-tagged with it -- including files whose names fail
-        # parsing, which land as placeholder "unparsed" rows so the user
-        # can see (and fix) them rather than wondering why they vanished.
-        batch_id = new_batch_id()
-        new = updated = preserved = unparsed = err = ignored_meta = 0
-        for fn in os.listdir(folder):
-            if not fn.lower().endswith(".csv"):
-                continue
-            # macOS AppleDouble sidecar files ("._foo.csv") are metadata
-            # created when files pass through Mac-synced storage, not real
-            # data. Skip them entirely so they never become phantom rows.
-            if fn.startswith("._"):
-                ignored_meta += 1
-                continue
-            full = os.path.join(folder, fn)
-            try:
-                meta = parse_filename(full)
-            except Exception as e:
-                # Filename didn't fit the convention. Record a placeholder
-                # row (review_status='unparsed', parse_error=msg) so the
-                # file appears in the staging table as a worklist entry
-                # for the upcoming rename pass instead of being silently
-                # dropped.
-                try:
-                    self.db.upsert_unparsed(full, str(e), batch_id=batch_id)
-                    unparsed += 1
-                except Exception as ue:
-                    err += 1
-                    self.log(
-                        f"  could not record unparsed file: {fn} -> {ue}")
-                continue
-            try:
-                result = self.db.upsert_preserving_edits(
-                    meta, batch_id=batch_id)
-                if result == "new":
-                    new += 1
-                elif result == "updated":
-                    updated += 1
-                elif result == "preserved":
-                    preserved += 1
-            except Exception as e:
-                err += 1
-                self.log(f"  DB write failed: {fn} -> {e}")
-        bits = [
-            f"{new} new",
-            f"{updated} updated",
-            f"{preserved} preserved (manually edited)",
-            f"{unparsed} unparsed (visible in table, flagged)",
-        ]
-        if err:
-            bits.append(f"{err} errored")
-        self.log("Ingested: " + ", ".join(bits) + ".")
-        if ignored_meta:
-            self.log(
-                f"Ignored {ignored_meta} macOS metadata file(s) (._*).")
-        # Only treat the batch as reviewable when at least one file actually
-        # landed as a new row. A re-browse of an already-known folder isn't
-        # something the reviewer cares about.
-        # Every file SEEN in this browse -- newly-inserted, refreshed,
-        # edit-preserved, or unparsed -- has now been re-tagged with this
-        # batch_id, so the staging view scoped to it mirrors exactly
-        # what's in the folder right now. Switch the active view to this
-        # batch whenever any rows were touched.
-        total_seen = new + updated + preserved + unparsed
-        if total_seen > 0:
-            self.latest_batch_id = batch_id
-            self._active_view = batch_id
-            self.log(
-                f"Batch {batch_id}: {total_seen} record(s) tagged to "
-                f"this folder and available in Review Imported Batch.")
-        # Prune rows whose files are no longer on disk. Done after ingest so
-        # the row counts in the staging table match the folder.
-        self._do_prune("after browse")
-        self._refresh_view_options()
-        self.refresh_filter_options()
-        self.refresh_table()
-
     def on_import_manifest(self):
         """Open the manifest import window (the second ingest front-end).
 
@@ -1013,9 +905,8 @@ class MainWindow(QMainWindow):
 
     def _after_manifest_ingest(self, batch_id: str):
         """Rows from the import window just landed in SQLite. Adopt the new
-        batch as the active view (mirrors the end of on_browse) and refresh
-        everything that reads the scans table."""
-        self.latest_batch_id = batch_id
+        batch as the active view and refresh everything that reads the scans
+        table."""
         self._active_view = batch_id
         self._refresh_view_options()
         self.refresh_filter_options()
@@ -1048,28 +939,6 @@ class MainWindow(QMainWindow):
             self.log(f"Pruned {pruned} missing file(s){tail}.")
         elif source == "manual sweep":
             self.log("No missing files to prune.")
-
-    def on_open_verification(self):
-        """Open the verification window for the most-recent batch.
-
-        Prefers the batch from this session's last on_browse; falls back to
-        the highest-sorting batch_id in the DB so the button still works at
-        app startup before any browse.
-        """
-        if not self._guard_pending():
-            return
-        batch_id = self.latest_batch_id or self.db.latest_batch_id()
-        if not batch_id:
-            self.log("No batch to review. Browse a folder first.")
-            return
-        records = self.db.records_in_batch(batch_id)
-        if not records:
-            self.log(f"Batch {batch_id} has no records to review.")
-            return
-        self._launch_verification_window(
-            records,
-            title_suffix=f"batch {batch_id}",
-            log_phrase=f"batch {batch_id} ({len(records)} record(s))")
 
     def on_review_selected(self):
         """Open the verification window for the currently-selected staging
@@ -1146,11 +1015,14 @@ class MainWindow(QMainWindow):
     def _refresh_view_options(self):
         """Repopulate the View dropdown from distinct batch_ids in the DB.
 
-        Item user-data is the actual batch_id (or "ALL"); item text is a
-        human-readable label combining the ISO timestamp, source folder,
-        and row count. Preserves current selection across rebuilds; falls
-        back to "All records" if the previously-active view has vanished
-        (e.g. all its files were pruned).
+        Item user-data is the actual batch_id (or "ALL") -- the import
+        timestamp lives THERE (the batch_id is timestamp-prefixed), so it is
+        retained as provenance and still distinguishes two imports of the same
+        folder. The visible LABEL shows only the folder name + row count; the
+        full import timestamp is moved to the item's tooltip so same-folder
+        re-imports stay tellable apart on hover. Preserves current selection
+        across rebuilds; falls back to "All records" if the previously-active
+        view has vanished (e.g. all its files were pruned).
         """
         summary = self.db.batches_summary()
         self.view_combo.blockSignals(True)
@@ -1159,10 +1031,12 @@ class MainWindow(QMainWindow):
         for bid, folder, count in summary:
             # batch_id format: ISO 'YYYY-MM-DDTHH:MM:SS_<uuid8>'. First 19
             # chars are the timestamp; swap the 'T' for a space so the
-            # label reads naturally.
+            # tooltip reads naturally. Label = folder only; timestamp -> tooltip.
             ts = bid[:19].replace("T", " ")
-            self.view_combo.addItem(
-                f"{ts}  —  {folder}  ({count})", bid)
+            row = self.view_combo.count()
+            self.view_combo.addItem(f"{folder}  ({count})", bid)
+            self.view_combo.setItemData(
+                row, f"Imported {ts}", Qt.ItemDataRole.ToolTipRole)
         idx = self.view_combo.findData(self._active_view)
         if idx < 0:
             # Active view no longer exists -- silently fall back to ALL.
@@ -1511,29 +1385,6 @@ class MainWindow(QMainWindow):
         the cloud's additive classification tags)."""
         self._cd_review_win = None
 
-    def on_promote_batch(self):
-        """Promote all confirmed records in the currently-viewed batch.
-
-        'Viewed batch' = the active View dropdown selection if it's a real
-        batch_id, else the most recent batch (session > DB). 'All records'
-        view falls back to the latest batch -- promoting every confirmed
-        row across history is too easy to trigger by accident.
-        """
-        if not self._guard_pending():
-            return
-        if self._active_view and self._active_view != "ALL":
-            batch_id = self._active_view
-        else:
-            batch_id = self.latest_batch_id or self.db.latest_batch_id()
-        if not batch_id:
-            self.log("No batch to promote. Browse a folder first.")
-            return
-        records = self.db.records_in_batch(batch_id)
-        if not records:
-            self.log(f"Batch {batch_id} has no records.")
-            return
-        self._run_promote(records, source=f"batch {batch_id}")
-
     def on_promote_selected(self):
         """Promote the currently-selected staging rows (confirmed ones only).
         """
@@ -1664,11 +1515,8 @@ class MainWindow(QMainWindow):
             self._set_cloud_status("failed", "Cloud: import failed")
             return
 
-        self.promote_batch_btn.setEnabled(False)
         self.promote_sel_btn.setEnabled(False)
-        old_text_b = self.promote_batch_btn.text()
         old_text_s = self.promote_sel_btn.text()
-        self.promote_batch_btn.setText("Promoting...")
         self.promote_sel_btn.setText("Promoting...")
         self._set_cloud_status("neutral", "Cloud: promoting...")
         # Pre-count confirmed so the user sees what's about to be attempted.
@@ -1691,9 +1539,7 @@ class MainWindow(QMainWindow):
                 f"Promote failed unexpectedly: {type(e).__name__}: {e}")
             self.log(traceback.format_exc())
         finally:
-            self.promote_batch_btn.setText(old_text_b)
             self.promote_sel_btn.setText(old_text_s)
-            self.promote_batch_btn.setEnabled(True)
             self.promote_sel_btn.setEnabled(True)
 
         # Mirror cloud inserts + already-present records into the local DB.
@@ -2201,7 +2047,7 @@ class MainWindow(QMainWindow):
             return self.on_save_edits()
         if clicked is discard_btn:
             self.pending_edits.clear()
-            # Caller is about to rebuild the table (refresh_table / on_browse),
+            # Caller is about to rebuild the table (e.g. refresh_table),
             # which will rebuild items without tints.
             return True
         return False

@@ -49,8 +49,8 @@ import traceback
 from datetime import datetime, timezone
 
 import numpy as np
-from PyQt6.QtCore import Qt, QPointF, QRect, QRectF, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog,
     QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
@@ -70,6 +70,18 @@ _SIGNAL_DOC_KEY = {"CD": "cd", "g": "g", "UV": "uv"}
 _SIGNAL_TITLES = {"CD": "CD (mdeg)", "g": "g-value", "UV": "UV-Vis (abs)"}
 _SIGNAL_COLORS = {"CD": "tab:blue", "g": "tab:green", "UV": "tab:red"}
 _PLOT_X_RANGE = (300, 700)
+
+# Default INITIAL handle positions for the CD analysis window when a record has
+# no saved manual_window. This is ONLY where the draggable handles START -- it
+# is NOT a clamp: the handles drag across the record's full spectral extent
+# (see CDReviewWindow._window_bounds). It is deliberately wider than the
+# classifier's measurement default (classifier.WINDOW_DEFAULT_*), which is left
+# untouched and still governs how a no-manual-window record is MEASURED.
+_DEFAULT_WINDOW_LO = 400.0
+_DEFAULT_WINDOW_HI = 550.0
+
+# Pixel radius for grabbing a window handle by clicking near it on the plot.
+_HANDLE_GRAB_PX = 10
 
 # Entry lifecycle tints. There is only ONE axis of state now -- reviewed or not.
 # GREY (the main-UI staging "not yet sorted" gray) = unreviewed / no human label;
@@ -191,120 +203,6 @@ def _metrics_cache_current(stored, fresh) -> bool:
     return True
 
 
-class RangeSlider(QWidget):
-    """Minimal native dual-handle range slider over a float [minimum, maximum]
-    span (data units = nm). Self-contained -- no third-party dependency.
-
-    Emits `sliderMoved(low, high)` CONTINUOUSLY while a handle is dragged (live
-    visual feedback) and `rangeChanged(low, high)` ONCE on release (the commit
-    point). The two handles cannot cross; values are clamped to the bounds.
-    """
-
-    sliderMoved = pyqtSignal(float, float)
-    rangeChanged = pyqtSignal(float, float)
-
-    def __init__(self, minimum=0.0, maximum=1.0, parent=None):
-        super().__init__(parent)
-        self._min = float(minimum)
-        self._max = float(maximum)
-        self._low = self._min
-        self._high = self._max
-        self._radius = 8                 # handle radius (px)
-        self._active = None              # 'low' | 'high' | None
-        self.setMinimumHeight(34)
-        self.setMinimumWidth(140)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Fixed)
-
-    # ---- public API ----
-    def setBounds(self, minimum, maximum):
-        self._min, self._max = float(minimum), float(maximum)
-        if self._max <= self._min:
-            self._max = self._min + 1.0
-        self._low = min(max(self._low, self._min), self._max)
-        self._high = min(max(self._high, self._low), self._max)
-        self.update()
-
-    def setValues(self, low, high):
-        lo, hi = float(low), float(high)
-        if hi < lo:
-            lo, hi = hi, lo
-        self._low = min(max(lo, self._min), self._max)
-        self._high = min(max(hi, self._low), self._max)
-        self.update()
-
-    def values(self) -> tuple:
-        return (self._low, self._high)
-
-    # ---- geometry ----
-    def _track(self) -> QRect:
-        m = self._radius + 2
-        return QRect(m, self.height() // 2 - 3,
-                     max(1, self.width() - 2 * m), 6)
-
-    def _val_to_x(self, v: float) -> float:
-        tr = self._track()
-        span = self._max - self._min
-        frac = (v - self._min) / span if span else 0.0
-        return tr.left() + frac * tr.width()
-
-    def _x_to_val(self, x: float) -> float:
-        tr = self._track()
-        frac = (x - tr.left()) / tr.width() if tr.width() else 0.0
-        frac = min(max(frac, 0.0), 1.0)
-        return self._min + frac * (self._max - self._min)
-
-    # ---- painting ----
-    def paintEvent(self, _ev):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        tr = self._track()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#cfd6dd"))                 # groove
-        p.drawRoundedRect(tr, 3, 3)
-        xlo, xhi = self._val_to_x(self._low), self._val_to_x(self._high)
-        p.setBrush(QColor("#ffd24d"))                 # selected span
-        p.drawRoundedRect(QRectF(xlo, float(tr.top()),
-                                 max(0.0, xhi - xlo), float(tr.height())), 3, 3)
-        cy = self.height() / 2.0
-        for x, on in ((xlo, self._active == "low"), (xhi, self._active == "high")):
-            p.setBrush(QColor("#f0a500") if on else QColor("#ffffff"))
-            p.setPen(QPen(QColor("#7a5c00"), 1.5))
-            p.drawEllipse(QPointF(x, cy), self._radius, self._radius)
-        p.end()
-
-    # ---- interaction ----
-    def _nearest_handle(self, x: float) -> str:
-        xlo, xhi = self._val_to_x(self._low), self._val_to_x(self._high)
-        if xlo == xhi:                                # overlapped -> pick by side
-            return "low" if x < xlo else "high"
-        return "low" if abs(x - xlo) <= abs(x - xhi) else "high"
-
-    def _drag_to(self, x: float):
-        v = self._x_to_val(x)
-        if self._active == "low":
-            self._low = min(v, self._high)
-        elif self._active == "high":
-            self._high = max(v, self._low)
-        self.update()
-        self.sliderMoved.emit(self._low, self._high)
-
-    def mousePressEvent(self, ev):
-        self._active = self._nearest_handle(ev.position().x())
-        self._drag_to(ev.position().x())
-
-    def mouseMoveEvent(self, ev):
-        if self._active is not None:
-            self._drag_to(ev.position().x())
-
-    def mouseReleaseEvent(self, _ev):
-        if self._active is None:
-            return
-        self._active = None
-        self.update()
-        self.rangeChanged.emit(self._low, self._high)
-
-
 class CDReviewWindow(QDialog):
     """Non-modal worklist + human-classification review over the verified cloud
     records. Reads + MEASURES on the main thread; the only cloud writes are the
@@ -325,6 +223,24 @@ class CDReviewWindow(QDialog):
         # All FOUR column lists (worklist + 3 category), so click handlers can
         # clear each other's selection.
         self._lists: list[QListWidget] = []
+
+        # CD analysis-window handle-drag state. The window is now selected by
+        # dragging two handle lines ON the spectral plot (no off-plot slider).
+        # _win_lo/_win_hi are the current handle positions (nm); _win_bounds is
+        # the draggable extent (the record's full spectral span); _win_patches
+        # / _handle_lines are the matplotlib artists; _active_handle is the
+        # handle being dragged; _dragged guards against a click committing a
+        # no-op.
+        self._win_lo: float | None = None
+        self._win_hi: float | None = None
+        self._win_bounds = (float(_PLOT_X_RANGE[0]), float(_PLOT_X_RANGE[1]))
+        self._win_patches: list = []
+        self._handle_lines: list = []
+        self._active_handle: str | None = None   # 'lo' | 'hi' | None
+        self._dragged = False
+        # True only during a synchronous cloud persist; blocks the plot-drag
+        # handlers from re-entering via QApplication.processEvents.
+        self._persisting = False
 
         self._build_ui()
         self.refresh(initial=True)
@@ -486,6 +402,11 @@ class CDReviewWindow(QDialog):
         self.ax_cd, self.ax_g, self.ax_uv = self.figure.subplots(
             3, 1, sharex=True)
         self._axes = {"CD": self.ax_cd, "g": self.ax_g, "UV": self.ax_uv}
+        # Dual-handle CD-window selection lives directly ON the plot: press
+        # near a handle line to grab it, drag to move, release to re-measure.
+        self.canvas.mpl_connect("button_press_event", self._on_plot_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_plot_release)
         pv.addWidget(self.canvas, stretch=1)
         # View-only zoom/pan toolbar (consistent with the rest of the app):
         # changes displayed limits only, never the data.
@@ -511,25 +432,27 @@ class CDReviewWindow(QDialog):
         dsplit.setStretchFactor(1, 2)
         v.addWidget(dsplit, stretch=1)
 
-        # ---- CD analysis-window slider (manual per-record override) ----
-        win_box = QGroupBox("CD analysis window  (drag handles; release to "
-                            "apply + re-measure + save)")
+        # ---- CD analysis-window control: drag the handles ON the plot;
+        # this row is the live READ-ONLY readout of where they sit (kept
+        # visible because manual_window is persisted per-record and drives
+        # computed_metrics, so the exact window must stay auditable). ----
+        win_box = QGroupBox("CD analysis window  (drag the handle lines on the "
+                            "plot; release to apply + re-measure + save)")
         wv = QVBoxLayout(win_box)
         srow = QHBoxLayout()
+        srow.addWidget(QLabel("Window:"))
         srow.addWidget(QLabel("min"))
         self.win_min_lbl = QLabel("—")
         self.win_min_lbl.setMinimumWidth(58)
         self.win_min_lbl.setStyleSheet("font-weight:bold;")
         srow.addWidget(self.win_min_lbl)
-        self.window_slider = RangeSlider(_PLOT_X_RANGE[0], _PLOT_X_RANGE[1])
-        self.window_slider.sliderMoved.connect(self._on_window_dragged)
-        self.window_slider.rangeChanged.connect(self._on_window_committed)
-        srow.addWidget(self.window_slider, stretch=1)
+        srow.addSpacing(12)
+        srow.addWidget(QLabel("max"))
         self.win_max_lbl = QLabel("—")
         self.win_max_lbl.setMinimumWidth(58)
         self.win_max_lbl.setStyleSheet("font-weight:bold;")
-        srow.addWidget(QLabel("max"))
         srow.addWidget(self.win_max_lbl)
+        srow.addStretch(1)
         self.reset_window_btn = QPushButton("Reset to default")
         self.reset_window_btn.setToolTip(
             "Clear this record's manual window and revert to the default CD "
@@ -743,7 +666,10 @@ class CDReviewWindow(QDialog):
         self.window_status.setText("")
         self.win_min_lbl.setText("—")
         self.win_max_lbl.setText("—")
+        self._win_lo = self._win_hi = None
+        self._active_handle = None
         self._win_patches = []
+        self._handle_lines = []
         for ax in self._axes.values():
             ax.clear()
         self._draw_axes_chrome()
@@ -770,7 +696,7 @@ class CDReviewWindow(QDialog):
         self.detail_header.setToolTip(
             f"record_id: {rid}" + (f"\nfile: {fname}" if fname else ""))
         self.metrics_label.setText(self._metrics_html(rec, res))
-        self._seed_window_slider(rec)
+        self._seed_window(rec)
         self._draw_detail_plots(idx)
         self._set_detail_enabled(True)
         self._set_human_radios(_human_label(rec))
@@ -885,27 +811,37 @@ class CDReviewWindow(QDialog):
             ax.set_title(_SIGNAL_TITLES[sig], fontsize=10)
             ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
 
-    def _draw_window_box(self, lo, hi):
-        """Shade the analysis window on BOTH the CD and UV axes (the CD couplet
-        is read inside it). Tracks the patches so a live slider drag can move
-        the box cheaply without replotting the curves. Pass None/None to clear.
-        The CD and UV axes share one x-range (sharex), so the box is vertically
-        aligned across both plots."""
-        for patch in getattr(self, "_win_patches", []):
+    def _redraw_window_artists(self):
+        """(Re)draw the analysis window from self._win_lo/_win_hi: a shaded span
+        plus a draggable handle line at each edge, on BOTH the CD and UV axes
+        (the CD couplet is read inside it). The CD and UV axes share one x-range
+        (sharex), so the box and handles stay vertically aligned across both.
+        Cheap enough to call on every drag step -- it touches only the window
+        artists, never the spectral curves. A no-op draws nothing when the
+        window is unset/degenerate."""
+        for art in self._win_patches + self._handle_lines:
             try:
-                patch.remove()
+                art.remove()
             except (ValueError, NotImplementedError):
                 pass
         self._win_patches = []
+        self._handle_lines = []
+        lo, hi = self._win_lo, self._win_hi
         if lo is not None and hi is not None and hi > lo:
             for ax in (self.ax_cd, self.ax_uv):
                 self._win_patches.append(
                     ax.axvspan(lo, hi, color="#ffd24d", alpha=0.15, zorder=0))
+                for x in (lo, hi):
+                    self._handle_lines.append(
+                        ax.axvline(x, color="#f0a500", linewidth=2.0,
+                                   zorder=8))
         self.canvas.draw_idle()
 
     def _draw_detail_plots(self, idx: int):
         rec, res = self.records[idx], self.results[idx]
-        self._win_patches = []        # cleared with the axes below
+        # ax.clear() drops the old window artists, so reset our handles to them.
+        self._win_patches = []
+        self._handle_lines = []
         for ax in self._axes.values():
             ax.clear()
 
@@ -916,12 +852,12 @@ class CDReviewWindow(QDialog):
                 wl, y = arr
                 ax.plot(wl, y, color=_SIGNAL_COLORS[sig], linewidth=1.3)
 
-        # --- analysis window: shade on BOTH CD and UV at the ACTUAL window the
-        # classifier used (res.window). A live slider drag re-draws this box at
-        # the candidate window via _draw_window_box; on release the record is
-        # re-measured so res.window == the committed manual window. None for
-        # un-computable / single-band records (nothing to shade).
-        self._draw_window_box(res.window_left, res.window_right)
+        # --- analysis window: shade + draggable handles on BOTH CD and UV at
+        # the CURRENT handle position (self._win_lo/_win_hi). _seed_window set
+        # these from the record's manual_window, or the default 400/550 start.
+        # On a live drag the box/handles follow the cursor; on release the
+        # record is re-measured so the committed manual window == the handles.
+        self._redraw_window_artists()
 
         # --- CD: mark the two lobes + the zero-crossing (crossover) ---
         pos, neg = res.cd_pos_lobe, res.cd_neg_lobe
@@ -963,55 +899,153 @@ class CDReviewWindow(QDialog):
             zorder=7)
 
     # --------------------------------------------- analysis-window slider ----
-    def _seed_window_slider(self, rec: dict):
-        """Initialize the slider to the record's stored manual_window if present,
-        else the global default (classifier.WINDOW_DEFAULT_*). blockSignals so
-        seeding never triggers a spurious commit/re-measure."""
-        self.window_slider.blockSignals(True)
-        self.window_slider.setBounds(_PLOT_X_RANGE[0], _PLOT_X_RANGE[1])
+    def _window_bounds(self, rec: dict) -> tuple:
+        """The draggable extent for the window handles: the record's FULL
+        spectral span (so a bisignate couplet's lobes outside the 400-550
+        default are still reachable). Falls back to the plot's fixed x-range
+        when the wavelength array is missing/odd."""
+        wl = rec.get("wavelength")
+        if wl:
+            try:
+                arr = [float(v) for v in wl]
+            except (TypeError, ValueError):
+                arr = []
+            if arr:
+                lo, hi = min(arr), max(arr)
+                if hi > lo:
+                    return lo, hi
+        return float(_PLOT_X_RANGE[0]), float(_PLOT_X_RANGE[1])
+
+    def _seed_window(self, rec: dict):
+        """Set the handle positions for a record: its stored manual_window if
+        present, else the default START position (_DEFAULT_WINDOW_LO/HI =
+        400/550), clamped into the record's draggable bounds. Only updates the
+        in-memory handle state + the nm readout; the artists are (re)drawn by
+        the subsequent _draw_detail_plots. No re-measure/commit happens here --
+        restore-on-open stays a pure read of manual_window."""
+        self._win_bounds = self._window_bounds(rec)
+        lo_b, hi_b = self._win_bounds
         mw = classifier._resolve_manual_window(rec.get("manual_window"))
         if mw is not None:
             lo, hi = mw
         else:
-            lo = classifier.WINDOW_DEFAULT_MIN
-            hi = classifier.WINDOW_DEFAULT_MAX
-        self.window_slider.setValues(lo, hi)
-        self.window_slider.blockSignals(False)
+            lo, hi = _DEFAULT_WINDOW_LO, _DEFAULT_WINDOW_HI
+        lo = max(lo_b, min(hi_b, float(lo)))
+        hi = max(lo, min(hi_b, float(hi)))
+        self._win_lo, self._win_hi = lo, hi
+        self._active_handle = None
         self.win_min_lbl.setText(f"{lo:.0f} nm")
         self.win_max_lbl.setText(f"{hi:.0f} nm")
 
     def _update_window_status(self, rec: dict, res):
         mw = classifier._resolve_manual_window(rec.get("manual_window"))
+        # Where the shaded handles currently sit (always set once a record is
+        # loaded; guarded just in case).
+        handles = (f"{self._win_lo:.0f}–{self._win_hi:.0f} nm"
+                   if self._win_lo is not None else "—")
         if mw is not None:
             self.window_status.setText(
                 f"<b>Manual window</b> {mw[0]:.0f}–{mw[1]:.0f} nm. Drag the "
-                f"handles to adjust, or <i>Reset to default</i>.")
+                f"handles on the plot to adjust, or <i>Reset to default</i>.")
         elif res.window_left is not None:
             self.window_status.setText(
-                f"No manual window set — measured under the <b>default</b> "
-                f"{res.window_left:.0f}–{res.window_right:.0f} nm. Drag the "
-                f"handles to set one for this record.")
+                f"No manual window set — metrics use the <b>default</b> "
+                f"{res.window_left:.0f}–{res.window_right:.0f} nm. The shaded "
+                f"handles start at {handles}; drag and release on the plot to "
+                f"set a manual window for this record.")
         else:
             self.window_status.setText(
-                "No manual window set. This record has no measurable CD window "
-                "(un-computable / single UV band). Drag the handles to set "
-                "one.")
+                "No manual window set, and this record has no measurable CD "
+                "window (un-computable / single UV band). Drag the shaded "
+                "handles on the plot and release to set one.")
 
-    def _on_window_dragged(self, lo: float, hi: float):
-        """Live during a handle drag: update the nm readouts and redraw the
-        shaded box only. Re-measurement is DEFERRED to release."""
-        self.win_min_lbl.setText(f"{lo:.0f} nm")
-        self.win_max_lbl.setText(f"{hi:.0f} nm")
-        self._draw_window_box(lo, hi)
+    # ---- on-plot handle dragging (x in nm; CD/g/UV share one x-axis) ----
+    def _nm_to_px(self, nm: float) -> float:
+        return float(self.ax_cd.transData.transform((nm, 0.0))[0])
 
-    def _on_window_committed(self, lo: float, hi: float):
-        """On handle RELEASE: set this record's manual_window, re-measure under
-        it, persist BOTH the window and the refreshed metrics cache together, and
-        refresh the metrics + markers + columns."""
+    def _px_to_nm(self, px: float) -> float:
+        return float(self.ax_cd.transData.inverted().transform((px, 0.0))[0])
+
+    def _handle_near(self, px: float):
+        """Which window handle ('lo'/'hi') is within grab range of pixel-x px,
+        or None. Ties (overlapped handles) resolve to 'lo'."""
+        if self._win_lo is None or px is None:
+            return None
+        d_lo = abs(px - self._nm_to_px(self._win_lo))
+        d_hi = abs(px - self._nm_to_px(self._win_hi))
+        if min(d_lo, d_hi) > _HANDLE_GRAB_PX:
+            return None
+        return "lo" if d_lo <= d_hi else "hi"
+
+    def _on_plot_press(self, event):
+        """Grab the nearest window handle if the click landed near one. Yields
+        to the matplotlib zoom/pan tools when they're active so they keep
+        working; does not move the handle yet (a no-motion click commits
+        nothing)."""
+        if (event.button != 1 or self.current_index < 0
+                or self._win_lo is None or event.x is None
+                or self._persisting):
+            return
+        if getattr(self.toolbar, "mode", ""):          # zoom/pan tool active
+            return
+        if event.inaxes not in (self.ax_cd, self.ax_g, self.ax_uv):
+            return
+        self._active_handle = self._handle_near(event.x)
+        self._dragged = False
+
+    def _on_plot_motion(self, event):
+        """While a handle is grabbed: move it (clamped to the draggable bounds,
+        no crossing), update the nm readout, and redraw the box + handles. When
+        idle, give resize-cursor feedback near a handle. Re-measure is DEFERRED
+        to release."""
+        if self._active_handle is None:
+            self._update_hover_cursor(event)
+            return
+        if event.x is None:
+            return
+        lo_b, hi_b = self._win_bounds
+        nm = max(lo_b, min(hi_b, self._px_to_nm(event.x)))
+        if self._active_handle == "lo":
+            self._win_lo = min(nm, self._win_hi)
+        else:
+            self._win_hi = max(nm, self._win_lo)
+        self._dragged = True
+        self.win_min_lbl.setText(f"{self._win_lo:.0f} nm")
+        self.win_max_lbl.setText(f"{self._win_hi:.0f} nm")
+        self._redraw_window_artists()
+
+    def _on_plot_release(self, _event):
+        """On handle release, commit the window (re-measure + persist) -- same
+        commit point the old slider used. A click with no drag commits
+        nothing."""
+        if self._active_handle is None:
+            return
+        self._active_handle = None
+        if not self._dragged:
+            return
+        self._dragged = False
+        self._commit_window()
+
+    def _update_hover_cursor(self, event):
+        over = (event is not None and event.x is not None
+                and event.inaxes in (self.ax_cd, self.ax_g, self.ax_uv)
+                and not getattr(self.toolbar, "mode", "")
+                and self._handle_near(event.x) is not None)
+        self.canvas.setCursor(
+            Qt.CursorShape.SplitHCursor if over
+            else Qt.CursorShape.ArrowCursor)
+
+    def _commit_window(self):
+        """Set this record's manual_window from the current handle positions,
+        re-measure under it, persist BOTH the window and the refreshed metrics
+        cache together, and refresh the metrics + markers + columns. Unchanged
+        persistence/recompute semantics -- only the input affordance moved from
+        a slider to the on-plot handles."""
         if not (0 <= self.current_index < len(self.records)):
             return
         idx = self.current_index
         rec = self.records[idx]
+        lo, hi = self._win_lo, self._win_hi
         mw = {"min_nm": round(float(lo), 1), "max_nm": round(float(hi), 1)}
         rec["manual_window"] = mw                       # mirror locally
         res = classifier.classify_record(rec)           # recompute under window
@@ -1041,7 +1075,7 @@ class CDReviewWindow(QDialog):
         metrics = classifier.computed_metrics_doc(res)
         rec["computed_metrics"] = metrics
         rec.pop("auto_classification", None)            # mirror legacy migration
-        self._seed_window_slider(rec)                   # back to default seed
+        self._seed_window(rec)                          # back to default seed
         self.metrics_label.setText(self._metrics_html(rec, res))
         self._draw_detail_plots(idx)
         self._update_window_status(rec, res)
@@ -1058,7 +1092,7 @@ class CDReviewWindow(QDialog):
             self.window_status.setText(
                 "⚠ Not saved to cloud: this record has no record_id.")
             return
-        self.window_slider.setEnabled(False)
+        self._persisting = True
         self.reset_window_btn.setEnabled(False)
         QApplication.processEvents()
         try:
@@ -1069,7 +1103,7 @@ class CDReviewWindow(QDialog):
             self._log(traceback.format_exc())
             res = {"ok": False, "message": str(e)}
         finally:
-            self.window_slider.setEnabled(True)
+            self._persisting = False
             self.reset_window_btn.setEnabled(True)
         if not res.get("ok"):
             self.window_status.setText(
@@ -1081,7 +1115,6 @@ class CDReviewWindow(QDialog):
             btn.setEnabled(enabled)
         self.save_override_btn.setEnabled(enabled)
         self.clear_override_btn.setEnabled(enabled)
-        self.window_slider.setEnabled(enabled)
         self.reset_window_btn.setEnabled(enabled)
 
     def _set_human_radios(self, label):
