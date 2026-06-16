@@ -1,0 +1,5 @@
+{
+  "Magic Green": { "role": "dopant",           "default_unit": "mg_ml",  "aliases": ["MG"] },
+  "DIO":         { "role": "solvent_additive", "default_unit": "vol_pct", "aliases": ["1,8-diiodooctane"] },
+  "CN":          { "role": "solvent_additive", "default_unit": "vol_pct", "aliases": ["chloronaphthalene", "1-chloronaphthalene"] }
+}

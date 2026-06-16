@@ -82,6 +82,29 @@ def _default_added_by() -> str:
     return os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
 
 
+def _additive_tail(record: dict) -> str:
+    """Short additive descriptor appended to the record header, e.g.
+    " + Magic Green 15mg_ml" or " + DIO 0.5vol_pct". Empty string when the
+    record has no additive (additive1_name blank). Cosmetic only -- reads the
+    flat additive1_* columns by name; spectrum-review logic is untouched.
+    """
+    name = (record.get("additive1_name") or "").strip() \
+        if isinstance(record.get("additive1_name"), str) \
+        else record.get("additive1_name")
+    if not name:
+        return ""
+    conc = record.get("additive1_conc")
+    unit = (record.get("additive1_unit") or "")
+    amount = ""
+    if conc is not None and str(conc).strip() != "":
+        try:
+            amount = f"{float(conc):g}"
+        except (TypeError, ValueError):
+            amount = str(conc).strip()
+        amount += str(unit).strip()
+    return f" + {name} {amount}".rstrip()
+
+
 def _flagged_fields(record: dict) -> set:
     """Parse a row's `flags` column as a JSON list of field names. Empty
     string / invalid JSON / non-list payload all yield the empty set.
@@ -499,9 +522,12 @@ class VerificationWindow(QDialog):
         r = self.records[index]
         status = r.get("review_status") or "pending"
         is_unparsed = status == "unparsed"
+        tail = _additive_tail(r)
+        tail_html = (f"  &nbsp;|&nbsp; <span style='color:#7a5;'>{tail.strip()}"
+                     f"</span>" if tail else "")
         self.record_header.setText(
             f"<b>Record {index + 1} of {len(self.records)}</b>  "
-            f"&nbsp;|&nbsp; status: <code>{status}</code>")
+            f"&nbsp;|&nbsp; status: <code>{status}</code>{tail_html}")
         self.path_label.setText(r["csv_path"])
 
         # Unparsed rows: surface the parse error, disable the form + the

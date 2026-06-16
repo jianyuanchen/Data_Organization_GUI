@@ -66,12 +66,19 @@ class Meta:
     peak_cd_wl: Optional[int] = None
     peak_uv: Optional[float] = None
     peak_uv_wl: Optional[int] = None
-    # Dopant metadata. Only the manifest ingest path supplies these (the
-    # filename convention never encoded dopants), so regex-parsed rows carry
-    # None in both. Optional[str]/Optional[float] like the other nullable
-    # fields; blank dopant == undoped film.
-    dopant: Optional[str] = None
-    dopant_conc: Optional[float] = None
+    # Additive block (registry-driven; supersedes the old dopant/dopant_conc
+    # fields). Only the manifest ingest path supplies these -- the filename
+    # convention never encoded additives -- so regex-parsed rows carry None in
+    # all of them. The unit travels WITH the value (additive1_unit) and the
+    # role is a queryable field (additive1_role), so a vol% solvent additive
+    # can't land silently-wrong in a mg/mL column. Blank additive1_name ==
+    # no additive. To extend to a second additive: bump config.MAX_ADDITIVES
+    # and copy-paste this block as additive2_* (a 5-line paste, not a refactor).
+    additive1_name: Optional[str] = None
+    additive1_role: Optional[str] = None      # one of config.ADDITIVE_ROLES
+    additive1_conc: Optional[float] = None
+    additive1_unit: Optional[str] = None       # one of config.ADDITIVE_UNITS
+    additive1_min: Optional[float] = None       # exposure/doping time (minutes)
     # ---- forward-looking metadata (stored, not yet used by any logic) -------
     # Stable per-record id. Independent of csv_path so it survives file moves
     # and is the durable hook for future MongoDB / vector-DB integrations.

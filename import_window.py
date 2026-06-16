@@ -25,13 +25,20 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QListWidget, QMessageBox, QPushButton, QSplitter,
-    QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+    QHeaderView, QLabel, QListWidget, QMenu, QMessageBox, QPushButton,
+    QSplitter, QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
 )
 
+import config
 import manifest
-from config import ORIENTATION_SCAN_SUFFIXES, PROCESSED_FILE_MARKERS
+from config import (
+    ADDITIVE_ROLES,
+    ADDITIVE_UNITS,
+    ORIENTATION_SCAN_SUFFIXES,
+    PROCESSED_FILE_MARKERS,
+    resolve_additive,
+)
 from database import ingest_manifest_record
 from models import canon_path
 
@@ -120,12 +127,12 @@ def _status_text(e: _Entry) -> str:
     return " ".join(parts)
 
 
-# Display-column specs: (header, getter(entry) -> str,
-#                        setter(raw, text) or None).
-# Combined columns (poly+chir, conc/solvent, anneal, dopant+conc) edit via a
-# light text syntax that the setter splits back into the underlying manifest
-# fields; anything unparseable lands raw in the primary field so validate_row
-# flags it instead of the edit being silently dropped.
+# Display-column specs (see _COLUMNS below for the full 4-tuple form).
+# Combined columns (poly+chir, conc/solvent, anneal) edit via a light text
+# syntax that the setter splits back into the underlying manifest fields;
+# anything unparseable lands raw in the primary field so validate_row flags it
+# instead of the edit being silently dropped. The additive block is NOT
+# combined -- it is five flat columns so the unit stays visible with the value.
 
 def _set_poly(name_key: str, chir_key: str):
     def setter(raw, text):
@@ -147,50 +154,97 @@ def _set_anneal(raw, text):
     raw["anneal_min"] = nums[1] if len(nums) > 1 else ""
 
 
-def _set_dopant(raw, text):
-    raw["dopant"], raw["dopant_conc_mg_ml"] = _split_paren(text)
-
-
 def _set_field(key: str):
     def setter(raw, text):
         raw[key] = (text or "").strip()
     return setter
 
 
+# Display-column specs are 4-tuples: (header, getter, setter|None, choices|None).
+# `choices` is a controlled vocabulary for dropdown columns (the additive role
+# and unit) -- _ChoiceDelegate renders a QComboBox for any column whose choices
+# is non-None; every other column edits as a plain QLineEdit. The additive
+# block is five flat columns (name / role / conc / unit / min) -- no combined
+# cell -- so the unit travels visibly with the value and the role is a
+# constrained pick rather than free text.
 _COLUMNS = [
-    ("status", _status_text, None),
-    ("series", lambda e: _fmt(e.raw.get("series")), _set_field("series")),
+    ("status", _status_text, None, None),
+    ("series", lambda e: _fmt(e.raw.get("series")),
+     _set_field("series"), None),
     ("poly1 (+chir)",
      lambda e: _join_paren(e.raw.get("poly1"), e.raw.get("poly1_chir")),
-     _set_poly("poly1", "poly1_chir")),
+     _set_poly("poly1", "poly1_chir"), None),
     ("poly2 (+chir)",
      lambda e: _join_paren(e.raw.get("poly2"), e.raw.get("poly2_chir")),
-     _set_poly("poly2", "poly2_chir")),
-    ("ratio", lambda e: _fmt(e.raw.get("ratio")), _set_field("ratio")),
+     _set_poly("poly2", "poly2_chir"), None),
+    ("ratio", lambda e: _fmt(e.raw.get("ratio")), _set_field("ratio"), None),
     ("conc / solvent",
      lambda e: (f"{_fmt(e.raw.get('conc_mg_ml'))} "
                 f"{_fmt(e.raw.get('solvent'))}").strip(),
-     _set_conc_solv),
+     _set_conc_solv, None),
     ("speed (mm/s)", lambda e: _fmt(e.raw.get("speed_mm_s")),
-     _set_field("speed_mm_s")),
-    ("state", lambda e: _fmt(e.raw.get("state")), _set_field("state")),
+     _set_field("speed_mm_s"), None),
+    ("state", lambda e: _fmt(e.raw.get("state")), _set_field("state"), None),
     ("anneal (°C / min)",
      lambda e: " / ".join(x for x in (_fmt(e.raw.get("anneal_T_C")),
                                       _fmt(e.raw.get("anneal_min"))) if x),
-     _set_anneal),
-    ("dopant (+conc)",
-     lambda e: _join_paren(e.raw.get("dopant"),
-                           e.raw.get("dopant_conc_mg_ml")),
-     _set_dopant),
+     _set_anneal, None),
+    ("additive", lambda e: _fmt(e.raw.get("additive1_name")),
+     _set_field("additive1_name"), None),
+    ("add. role", lambda e: _fmt(e.raw.get("additive1_role")),
+     _set_field("additive1_role"), ADDITIVE_ROLES),
+    ("add. conc", lambda e: _fmt(e.raw.get("additive1_conc")),
+     _set_field("additive1_conc"), None),
+    ("add. unit", lambda e: _fmt(e.raw.get("additive1_unit")),
+     _set_field("additive1_unit"), ADDITIVE_UNITS),
+    ("add. min", lambda e: _fmt(e.raw.get("additive1_min")),
+     _set_field("additive1_min"), None),
     ("peak_gval", lambda e: _fmt(e.raw.get("peak_gval")),
-     _set_field("peak_gval")),
+     _set_field("peak_gval"), None),
     ("peak_wl", lambda e: _fmt(e.raw.get("peak_wl_nm")),
-     _set_field("peak_wl_nm")),
+     _set_field("peak_wl_nm"), None),
     # filename is the JOIN KEY -- read-only (setter None) so it can never be
     # altered in the window and break the row<->CSV link.
-    ("filename", lambda e: _fmt(e.raw.get("filename")), None),
+    ("filename", lambda e: _fmt(e.raw.get("filename")), None, None),
 ]
 _STATUS_COL = 0
+
+
+class _ChoiceDelegate(QStyledItemDelegate):
+    """Render a constrained-vocabulary QComboBox for columns whose _COLUMNS
+    entry carries a non-None `choices` list (additive role / unit); fall back
+    to the default line-edit editor for every other column. A leading blank
+    item is always offered so a cell can be cleared back to 'unset'."""
+
+    def _choices(self, index):
+        col = index.column()
+        if 0 <= col < len(_COLUMNS):
+            return _COLUMNS[col][3]
+        return None
+
+    def createEditor(self, parent, option, index):
+        choices = self._choices(index)
+        if not choices:
+            return super().createEditor(parent, option, index)
+        cb = QComboBox(parent)
+        cb.addItem("")                       # blank = unset / auto-fill
+        cb.addItems(list(choices))
+        return cb
+
+    def setEditorData(self, editor, index):
+        if isinstance(editor, QComboBox):
+            cur = index.data(Qt.ItemDataRole.EditRole) or ""
+            i = editor.findText(str(cur))
+            editor.setCurrentIndex(i if i >= 0 else 0)
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):
+        if isinstance(editor, QComboBox):
+            model.setData(index, editor.currentText(),
+                          Qt.ItemDataRole.EditRole)
+        else:
+            super().setModelData(editor, model, index)
 
 
 class _ManifestModel(QAbstractTableModel):
@@ -361,6 +415,13 @@ class ImportWindow(QDialog):
         self.view.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
         self.view.horizontalHeader().setStretchLastSection(True)
+        # Dropdown editors for the constrained additive role / unit columns.
+        self._choice_delegate = _ChoiceDelegate(self.view)
+        self.view.setItemDelegate(self._choice_delegate)
+        # Right-click menu: "Add to registry" for amber unknown-additive rows.
+        self.view.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._on_context_menu)
         self.view.selectionModel().selectionChanged.connect(
             self._on_selection_changed)
         self.model.dataChanged.connect(
@@ -609,6 +670,86 @@ class ImportWindow(QDialog):
             if 0 <= src.row() < len(self.entries):
                 out.append(self.entries[src.row()])
         return out
+
+    # ---- additive registry (Add to registry) ------------------------------
+    @staticmethod
+    def _is_unknown_additive(e: _Entry) -> bool:
+        """True when a manifest row names an additive that the registry can't
+        resolve -- the amber 'unknown additive' state that 'Add to registry'
+        clears."""
+        if e.is_orphan:
+            return False
+        name = (e.raw.get("additive1_name") or "").strip()
+        if not name:
+            return False
+        _, entry = resolve_additive(name)
+        return entry is None
+
+    def _entry_at(self, pos) -> "_Entry | None":
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return None
+        src = self.proxy.mapToSource(idx)
+        if 0 <= src.row() < len(self.entries):
+            return self.entries[src.row()]
+        return None
+
+    def _on_context_menu(self, pos):
+        """Right-click menu. The only entry today is 'Add to registry', shown
+        for an unknown-additive row so its name resolves automatically next
+        time. Keeps the flat inline-edit table -- no new panels."""
+        e = self._entry_at(pos)
+        if e is None:
+            return
+        menu = QMenu(self.view)
+        if self._is_unknown_additive(e):
+            name = (e.raw.get("additive1_name") or "").strip()
+            act = menu.addAction(f"Add “{name}” to additive registry…")
+            act.triggered.connect(lambda _=False, ent=e: self._add_to_registry(ent))
+        if menu.isEmpty():
+            act = menu.addAction("(no actions for this row)")
+            act.setEnabled(False)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def _add_to_registry(self, e: _Entry):
+        """Append the row's additive to additive_registry.json (role + unit
+        taken from the row's dropdowns), reload the registry, and re-validate
+        so the row clears to green. The raw token seen is recorded as an alias
+        so any spelling variant resolves next time."""
+        name = (e.raw.get("additive1_name") or "").strip()
+        role = (e.raw.get("additive1_role") or "").strip()
+        unit = (e.raw.get("additive1_unit") or "").strip()
+        if role in ("", "unknown") or role not in ADDITIVE_ROLES:
+            QMessageBox.information(
+                self, "Set a role first",
+                f"Pick a concrete additive1_role for “{name}” from the "
+                f"dropdown (anything except 'unknown'), then add it to the "
+                f"registry.")
+            return
+        if unit not in ADDITIVE_UNITS:
+            QMessageBox.information(
+                self, "Set a unit first",
+                f"Pick an additive1_unit for “{name}” from the dropdown "
+                f"({', '.join(ADDITIVE_UNITS)}), then add it to the registry.")
+            return
+        try:
+            entry = config.add_additive_to_registry(
+                name, role, unit, aliases=[name])
+        except Exception as ex:
+            QMessageBox.warning(
+                self, "Could not update registry",
+                f"{type(ex).__name__}: {ex}")
+            return
+        self.log(f"Added '{name}' to additive registry "
+                 f"(role={entry['role']}, default_unit={entry['default_unit']}).")
+        # Re-validate every entry naming this additive so they clear at once.
+        for other in self.entries:
+            if (not other.is_orphan
+                    and (other.raw.get("additive1_name") or "").strip().lower()
+                    == name.lower()):
+                self._revalidate(other)
+        self.model.reset()
+        self._after_model_change()
 
     def _sync_confirm_enabled(self):
         sel = self._selected_entries()

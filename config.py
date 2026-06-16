@@ -9,15 +9,18 @@ cloud configured.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-_ENV_PATH = Path(__file__).resolve().parent / ".env"
+_HERE = Path(__file__).resolve().parent
+_ENV_PATH = _HERE / ".env"
 load_dotenv(_ENV_PATH)
 
 MONGODB_URI: str | None = os.getenv("MONGODB_URI") or None
@@ -31,6 +34,148 @@ def mongo_configured() -> bool:
 
 if not mongo_configured():
     logger.warning("MongoDB not configured — set MONGODB_URI in .env")
+
+
+# ---------------------------------------------------------------------------
+# Additive registry -- the queryable vocabulary behind the additive block.
+#
+# Films carry 0..MAX_ADDITIVES additives. Each additive's UNIT travels with its
+# value (mg_ml, vol_pct, ...) and its ROLE (dopant, solvent_additive, ...) is a
+# first-class field, so a vol% solvent additive can never land silently-wrong in
+# what used to be a mg/mL `dopant_conc` column.
+#
+# The registry maps a CANONICAL additive name to its default role + unit + the
+# raw aliases that should resolve to it. It is loaded from `additive_registry.json`
+# (next to this file) at import so the "Add to registry" UI action can APPEND a
+# new entry to JSON -- never rewrite this .py source -- and reload_additive_registry()
+# picks it up for the next validation pass. resolve_additive() is the single
+# name-resolver that replaces every hardcoded "MG -> Magic Green" special-case.
+# ---------------------------------------------------------------------------
+
+# Constrained enums. additive1_role / additive1_unit are validated against these
+# the way `solvent` is validated against models.SOLVENTS -- a typo'd role or a
+# bogus unit is caught at ingest instead of silently corrupting a query later.
+ADDITIVE_ROLES = ["dopant", "solvent_additive", "plasticizer",
+                  "nucleating_agent", "unknown"]
+ADDITIVE_UNITS = ["mg_ml", "vol_pct", "mol_pct", "wt_pct"]
+
+# Films are 0-1 additive today. To extend: bump this AND copy-paste the
+# additive1_* block in MANIFEST_COLUMNS / models.Meta as additive2_* (the
+# rest of the pipeline -- validator, cloud collapse -- already loops to
+# MAX_ADDITIVES, so no other code changes).
+MAX_ADDITIVES = 1
+
+_ADDITIVE_REGISTRY_PATH = _HERE / "additive_registry.json"
+
+
+def _load_additive_registry() -> dict:
+    """Read additive_registry.json into a dict. A missing/corrupt file yields an
+    empty registry (logged) rather than crashing import -- the app still runs,
+    every additive just reads as UNKNOWN until the file is restored."""
+    try:
+        with open(_ADDITIVE_REGISTRY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("additive_registry.json is not a JSON object")
+        return data
+    except FileNotFoundError:
+        logger.warning("additive_registry.json not found at %s -- additives "
+                       "will read as unknown", _ADDITIVE_REGISTRY_PATH)
+        return {}
+    except Exception as e:
+        logger.warning("could not load additive_registry.json (%s: %s) -- "
+                       "additives will read as unknown", type(e).__name__, e)
+        return {}
+
+
+ADDITIVE_REGISTRY: dict = _load_additive_registry()
+
+
+def reload_additive_registry() -> dict:
+    """Re-read additive_registry.json into the module-global ADDITIVE_REGISTRY.
+
+    Reassigns the module global so resolve_additive() (defined here, so it reads
+    this module's namespace at call time) immediately sees new entries -- the
+    "Add to registry" action calls this after appending, and the next validation
+    pass resolves the just-added additive. Returns the fresh registry.
+    """
+    global ADDITIVE_REGISTRY
+    ADDITIVE_REGISTRY = _load_additive_registry()
+    return ADDITIVE_REGISTRY
+
+
+def resolve_additive(name: str):
+    """Resolve a raw additive name to (canonical_name, registry_entry|None).
+
+    Matches case-insensitively against registry KEYS and each entry's ALIASES,
+    so "mg", "MG" and "magic green" all resolve to ("Magic Green", {...}).
+    Returns (cleaned_name, None) for a non-blank name that matches nothing
+    (an UNKNOWN additive) and ("", None) for a blank name. This is the ONE
+    place name->canonical resolution happens.
+    """
+    cleaned = (name or "").strip()
+    if not cleaned:
+        return "", None
+    low = cleaned.lower()
+    for canonical, entry in ADDITIVE_REGISTRY.items():
+        if low == canonical.lower():
+            return canonical, entry
+        for alias in (entry.get("aliases") or []):
+            if low == str(alias).strip().lower():
+                return canonical, entry
+    return cleaned, None
+
+
+def add_additive_to_registry(name: str, role: str, default_unit: str,
+                             aliases=None) -> dict:
+    """APPEND (or update) one additive entry in additive_registry.json, then
+    reload ADDITIVE_REGISTRY.
+
+    Writes JSON only -- never this .py source. The write is atomic (temp file in
+    the same directory + os.replace) so an interrupted save never leaves a
+    half-written, unparseable registry. `name` is stored as the canonical key;
+    `aliases` records any raw token(s) seen so a future manifest using them
+    resolves automatically. Returns the stored entry. Raises on bad
+    role/unit/name so the caller can surface the problem instead of writing
+    garbage into the vocabulary.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("additive name is blank")
+    if role not in ADDITIVE_ROLES:
+        raise ValueError(f"role '{role}' not in {ADDITIVE_ROLES}")
+    if default_unit not in ADDITIVE_UNITS:
+        raise ValueError(f"unit '{default_unit}' not in {ADDITIVE_UNITS}")
+
+    # Start from the on-disk file (not the in-memory copy) so a concurrent edit
+    # to the JSON isn't clobbered by a stale registry.
+    data = _load_additive_registry()
+    seen = {str(a).strip() for a in (data.get(name, {}).get("aliases") or [])}
+    for a in (aliases or []):
+        a = str(a).strip()
+        if a and a.lower() != name.lower():
+            seen.add(a)
+    entry = {"role": role, "default_unit": default_unit,
+             "aliases": sorted(seen)}
+    data[name] = entry
+
+    fd, tmp = tempfile.mkstemp(prefix=".additive-registry-", suffix=".json",
+                               dir=str(_HERE))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _ADDITIVE_REGISTRY_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    reload_additive_registry()
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +243,38 @@ MANIFEST_COLUMNS = [
     {"name": "anneal_min", "required": False, "type": "float", "allowed": None,
      "maps_to": "Meta.anneal_time",
      "notes": "anneal time in minutes; blank defaults to 10 (AN films only)"},
-    {"name": "dopant", "required": False, "type": "str", "allowed": None,
-     "maps_to": "Meta.dopant", "notes": "blank = undoped"},
-    {"name": "dopant_conc_mg_ml", "required": False, "type": "float",
+    # ---- Additive block (registry-driven; replaces the old dopant columns) --
+    # The unit travels WITH the value and the role is a queryable field, so a
+    # vol% solvent additive can't masquerade as a mg/mL dopant. additive1_name
+    # resolves via config.resolve_additive (registry keys + aliases); role/unit
+    # auto-fill from the registry default when blank. Blank name == no additive
+    # (all additive1_* cells must then be blank).
+    #
+    # To add a SECOND additive later: bump config.MAX_ADDITIVES and copy-paste
+    # this 5-column block as additive2_name / additive2_role / additive2_conc /
+    # additive2_unit / additive2_min (same maps_to with the index bumped). No
+    # other code changes -- the validator and the cloud-doc collapse already
+    # loop to MAX_ADDITIVES.
+    {"name": "additive1_name", "required": False, "type": "str",
+     "allowed": None, "maps_to": "Meta.additive1_name",
+     "notes": "blank = no additive; resolves via additive registry "
+              "(keys + aliases, e.g. 'MG' -> 'Magic Green')"},
+    {"name": "additive1_role", "required": False, "type": "str",
+     "allowed": ADDITIVE_ROLES, "maps_to": "Meta.additive1_role",
+     "notes": "auto-filled from the registry default when blank; "
+              "controlled vocabulary"},
+    {"name": "additive1_conc", "required": False, "type": "float",
      "allowed": None,
-     "condition": "REQUIRED iff dopant is present",
-     "maps_to": "Meta.dopant_conc", "notes": "dopant concentration in mg/mL"},
+     "condition": "expected when additive1_name is present (flagged if blank)",
+     "maps_to": "Meta.additive1_conc",
+     "notes": "additive concentration; UNIT is additive1_unit (not assumed)"},
+    {"name": "additive1_unit", "required": False, "type": "str",
+     "allowed": ADDITIVE_UNITS, "maps_to": "Meta.additive1_unit",
+     "notes": "unit of additive1_conc; auto-filled from registry default when "
+              "blank; controlled vocabulary"},
+    {"name": "additive1_min", "required": False, "type": "float",
+     "allowed": None, "maps_to": "Meta.additive1_min",
+     "notes": "additive exposure/doping time in minutes (blank = unspecified)"},
     {"name": "peak_gval", "required": False, "type": "float", "allowed": None,
      "maps_to": "scans.manifest_peak_g (provenance only)",
      "notes": "CHECKSUM ONLY -- cross-checked against the value computed from "

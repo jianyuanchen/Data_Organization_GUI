@@ -260,6 +260,13 @@ _NON_COMPARABLE = {
     "promoted", "promoted_at", "edited",      # local bookkeeping
     "added_by", "verified", "verified_date",  # provenance / workflow
     "review_status", "parse_error", "flags",  # workflow / diagnostics
+    # Additive block: the local record carries FLAT additive1_* columns while
+    # the cloud doc carries the nested `additives` array (_build_cloud_doc is
+    # the only translator). Excluding both sides keeps the flat/nested shape
+    # difference from registering as spurious differing-field noise.
+    "additives",
+    "additive1_name", "additive1_role", "additive1_conc",
+    "additive1_unit", "additive1_min",
 }
 
 
@@ -274,6 +281,64 @@ def _diff_fields(rec: dict, doc: dict) -> list:
     return sorted(k for k in keys if rec.get(k) != doc.get(k))
 
 
+def _num_or_none(x):
+    """float(x) for a non-blank numeric, else None. Keeps the nested additive
+    conc/min stored as real numbers (or absent) rather than stray strings."""
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collapse_additives(doc: dict) -> None:
+    """Fold the flat additiveN_* columns into a nested `additives` array, in
+    place, dropping empty entries. This is the ONLY place the flat->nested
+    translation happens. An undoped record yields "additives": [].
+
+    Each additive with a non-blank name becomes
+        {"name", "role", "conc": <float|None>, "unit", "min": <float|None>}.
+    The flat additiveN_* keys are removed from the doc either way (even empty
+    ones) so the stored shape is purely nested. A pre-migration record that
+    still carries a flat `dopant`/`dopant_conc` pair is folded in too, so no
+    legacy local row leaks an old-shape field into the cloud.
+    """
+    try:
+        max_n = int(config.MAX_ADDITIVES)
+    except Exception:
+        max_n = 1
+    additives = []
+    for i in range(1, max_n + 1):
+        name = doc.pop(f"additive{i}_name", None)
+        role = doc.pop(f"additive{i}_role", None)
+        conc = doc.pop(f"additive{i}_conc", None)
+        unit = doc.pop(f"additive{i}_unit", None)
+        minutes = doc.pop(f"additive{i}_min", None)
+        if name not in (None, ""):
+            additives.append({"name": name, "role": role,
+                              "conc": _num_or_none(conc), "unit": unit,
+                              "min": _num_or_none(minutes)})
+    # Legacy safety net: a row staged before the migration may still carry the
+    # old flat dopant columns. Fold them in (role=dopant, unit=mg_ml) so they
+    # never reach the cloud as old-shape fields, and drop them regardless.
+    legacy_dopant = doc.pop("dopant", None)
+    legacy_conc = doc.pop("dopant_conc", None)
+    if (legacy_dopant not in (None, "")
+            and not any(a["name"] == legacy_dopant for a in additives)):
+        additives.append({"name": legacy_dopant, "role": "dopant",
+                          "conc": _num_or_none(legacy_conc), "unit": "mg_ml",
+                          "min": None})
+    doc["additives"] = additives
+
+
+def cloud_additives(doc: dict) -> list:
+    """Tolerant accessor for a cloud doc's additives. Older docs predate the
+    `additives` key (or were undoped); treat both as the empty list so any
+    reader can iterate without a KeyError or a None check."""
+    return doc.get("additives") or []
+
+
 def _build_cloud_doc(record: dict, wavelength, g, cd, uv, data_hash: str,
                      fkey: str, filename: str, promoted_at: str) -> dict:
     """Build the canonical stored cloud document from a local record + spectra.
@@ -283,6 +348,9 @@ def _build_cloud_doc(record: dict, wavelength, g, cd, uv, data_hash: str,
     doc is byte-for-byte the same shape as a freshly inserted one. Strips any
     incoming _id -- insert_one assigns a fresh one; replace_one preserves the
     matched doc's existing _id.
+
+    The flat additive1_* columns are collapsed into a nested `additives` array
+    here (_collapse_additives) -- this is the ONLY place flat->nested happens.
     """
     doc = dict(record)
     doc.pop("_id", None)
@@ -295,6 +363,7 @@ def _build_cloud_doc(record: dict, wavelength, g, cd, uv, data_hash: str,
     doc["filename"] = filename
     doc["record_id"] = record.get("record_id")  # trace of machine, NOT a key
     doc["promoted_at"] = promoted_at
+    _collapse_additives(doc)
     return doc
 
 

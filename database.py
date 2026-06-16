@@ -21,8 +21,9 @@ DB_PATH = "cd_metadata.db"
 _TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
               "p1_hand", "p2_name", "p2_backbone", "p2_chirality", "p2_hand",
               "config", "ratio", "solvent", "film_state",
-              # dopant metadata (manifest path only; regex rows carry NULL)
-              "dopant",
+              # additive block (manifest path only; regex rows carry NULL).
+              # Supersedes the old `dopant` TEXT column.
+              "additive1_name", "additive1_role", "additive1_unit",
               # forward-looking metadata
               "record_id", "flags", "verified_date", "added_by",
               # batch + verification state
@@ -30,7 +31,8 @@ _TEXT_COLS = {"csv_path", "series", "p1_name", "p1_backbone", "p1_chirality",
               # parse diagnostic (only set on review_status='unparsed' rows)
               "parse_error"}
 _REAL_COLS = {"speed_mm_s", "peak_g", "peak_wl", "peak_cd", "peak_uv",
-              "dopant_conc"}
+              # additive block numerics (supersede the old `dopant_conc` REAL)
+              "additive1_conc", "additive1_min"}
 
 # Manifest-ingest extras. Live on every scans row but are NOT part of
 # COLUMNS / Meta -- same pattern as `edited` / `promoted`: managed only by
@@ -278,6 +280,17 @@ class DB:
         re-groups its files under the current view. The user's content
         (edits, review_status, verification metadata, record_id) is still
         preserved on the 'preserved' path -- only batch_id moves.
+
+        ADDITIVE LABELING (additive1_*): these are ordinary COLUMNS, so the
+        whole-row 'preserved' path already protects them once a row is
+        hand-edited. A human-confirmed additive role/unit becomes edited==1
+        the moment it is changed in the staging table (update_cell) or the
+        verification window (set_review's field_edits, which also flips
+        edited=1), so a subsequent manifest re-import takes the 'preserved'
+        branch and never reverts the labeling work. An UN-edited row, by
+        contrast, legitimately re-tracks the manifest+registry (an undoped
+        row that a corrected manifest dopes must update), which is exactly
+        the 'updated' branch below.
         """
         cur = self.conn.execute(
             "SELECT edited FROM scans WHERE csv_path=?", (m.csv_path,))
