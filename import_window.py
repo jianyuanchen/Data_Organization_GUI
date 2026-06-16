@@ -23,11 +23,14 @@ import traceback
 from PyQt6.QtCore import (
     QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal,
 )
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import (
+    QBrush, QColor, QKeySequence, QShortcut, QUndoCommand, QUndoStack,
+)
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QListWidget, QMenu, QMessageBox, QPushButton,
-    QSplitter, QStyledItemDelegate, QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QFileDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMenu,
+    QMessageBox, QPushButton, QSplitter, QStyledItemDelegate, QTableView,
+    QVBoxLayout, QWidget,
 )
 
 import config
@@ -247,6 +250,59 @@ class _ChoiceDelegate(QStyledItemDelegate):
             super().setModelData(editor, model, index)
 
 
+# ---------------------------------------------------------------------------
+# Undo/redo. Every cell change -- typed edit, dropdown pick, or bulk paste --
+# is applied through ImportWindow._apply_cell (the one validated write path:
+# column setter -> _revalidate -> status recompute). These commands wrap that
+# path so undo restores BOTH the prior display value AND the prior `dirty`
+# flag (the import-window analog of the SQLite `edited` preserve flag): a cell
+# that was clean before the edit returns to clean on undo, so it isn't left
+# falsely marked as carrying an unsaved manifest edit.
+#
+# Qt calls redo() once on push(), so push IS the apply -- setData/paste never
+# pre-apply, keeping a single write per change with no double-apply.
+# ---------------------------------------------------------------------------
+
+class _CellEditCommand(QUndoCommand):
+    """One cell's edit: (row, col, old_value, old_dirty, new_value)."""
+
+    def __init__(self, window, row, col, old_value, old_dirty, new_value,
+                 text="edit cell"):
+        super().__init__(text)
+        self.window = window
+        self.row, self.col = row, col
+        self.old_value, self.old_dirty = old_value, old_dirty
+        self.new_value = new_value
+
+    def redo(self):
+        self.window._apply_cell(self.row, self.col, self.new_value,
+                                dirty=True)
+
+    def undo(self):
+        self.window._apply_cell(self.row, self.col, self.old_value,
+                                dirty=self.old_dirty)
+
+
+class _MultiCellEditCommand(QUndoCommand):
+    """A bulk fill / paste as ONE undoable action. Holds only the cells
+    actually written (skipped non-editable / invalid-enum cells are never
+    recorded), each as (row, col, old_value, old_dirty, new_value), so a
+    single undo reverts exactly the fill -- value AND dirty flag per cell."""
+
+    def __init__(self, window, cells, text="paste cells"):
+        super().__init__(text)
+        self.window = window
+        self.cells = list(cells)
+
+    def redo(self):
+        for row, col, _old_v, _old_d, new_v in self.cells:
+            self.window._apply_cell(row, col, new_v, dirty=True)
+
+    def undo(self):
+        for row, col, old_v, old_d, _new_v in self.cells:
+            self.window._apply_cell(row, col, old_v, dirty=old_d)
+
+
 class _ManifestModel(QAbstractTableModel):
     """Thin adapter over ImportWindow's entry list. Edits write back into
     entry.raw via the column setter, then the window revalidates the entry
@@ -298,17 +354,26 @@ class _ManifestModel(QAbstractTableModel):
         return base
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        """A single typed/dropdown edit. Does NOT mutate directly -- it pushes
+        a _CellEditCommand onto the window's undo stack, whose redo() performs
+        the one validated write (window._apply_cell). This keeps typed edits,
+        pastes, and undo/redo on the same write path while making every edit
+        undoable. A no-op edit (new == current) pushes nothing."""
         if not index.isValid() or role != Qt.ItemDataRole.EditRole:
             return False
-        e = self.entries[index.row()]
-        setter = _COLUMNS[index.column()][2]
+        row, col = index.row(), index.column()
+        e = self.entries[row]
+        setter = _COLUMNS[col][2]
         if setter is None or e.is_orphan:
             return False
-        setter(e.raw, str(value))
-        e.dirty = True            # in-memory edit not yet saved to manifest.csv
-        e.staged = False          # edited after staging -> needs re-confirm
-        self.window._revalidate(e)
-        self.row_changed(index.row())
+        old_value = _COLUMNS[col][1](e)
+        new_value = str(value)
+        if new_value == old_value:
+            return True           # no change -> no command, no churn
+        self.window.undo_stack.push(
+            _CellEditCommand(self.window, row, col, old_value, e.dirty,
+                             new_value,
+                             text=f"edit {_COLUMNS[col][0]}"))
         return True
 
     def row_changed(self, row: int):
@@ -364,6 +429,9 @@ class ImportWindow(QDialog):
         self._manifest_path: str | None = None
         self._base_folder: str | None = None
         self._suppressed = 0          # on-disk CSVs skipped by the orphan check
+        # Undo/redo for inline edits + bulk paste. Cleared on every (re)load
+        # so stale row indices can never be replayed onto a different manifest.
+        self.undo_stack = QUndoStack(self)
 
         self.setWindowTitle("Import Manifest")
         self.resize(1280, 640)
@@ -405,8 +473,11 @@ class ImportWindow(QDialog):
         self.proxy.setSourceModel(self.model)
         self.view = QTableView()
         self.view.setModel(self.proxy)
+        # Cell-level rectangular selection (Excel-style): click-drag selects a
+        # block of cells for copy/paste. (Confirm derives its rows from whatever
+        # cells are selected -- see _selected_entries.)
         self.view.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
+            QAbstractItemView.SelectionBehavior.SelectItems)
         self.view.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self.view.setEditTriggers(
@@ -426,6 +497,7 @@ class ImportWindow(QDialog):
             self._on_selection_changed)
         self.model.dataChanged.connect(
             lambda *_: self._after_model_change())
+        self._install_shortcuts()
 
         side = QWidget()
         side_v = QVBoxLayout(side)
@@ -531,6 +603,8 @@ class ImportWindow(QDialog):
             self._revalidate(e)
         self.entries.extend(self._find_orphans())
 
+        # New entry list -> any prior undo history points at stale row indices.
+        self.undo_stack.clear()
         self.model.reset()
         self.view.resizeColumnsToContents()
         self.reload_btn.setEnabled(True)
@@ -663,13 +737,163 @@ class ImportWindow(QDialog):
         self._show_reasons_for_current()
 
     def _selected_entries(self) -> list[_Entry]:
-        rows = self.view.selectionModel().selectedRows()
-        out = []
-        for idx in sorted(rows, key=lambda i: i.row()):
+        """Distinct entries that have ANY selected cell, in row order. With
+        cell-level (SelectItems) selection, selectedRows() would only return
+        fully-selected rows; deriving from selectedIndexes() lets Confirm work
+        whether the user selected a whole row, a single cell, or a block."""
+        seen: dict[int, _Entry] = {}
+        for idx in self.view.selectionModel().selectedIndexes():
             src = self.proxy.mapToSource(idx)
-            if 0 <= src.row() < len(self.entries):
-                out.append(self.entries[src.row()])
-        return out
+            r = src.row()
+            if 0 <= r < len(self.entries) and r not in seen:
+                seen[r] = self.entries[r]
+        return [seen[r] for r in sorted(seen)]
+
+    # ---- copy / paste / undo (Excel-style) --------------------------------
+    def _install_shortcuts(self):
+        """Ctrl+C / Ctrl+V / Ctrl+Z / Ctrl+Y (+Ctrl+Shift+Z), scoped to the
+        table view so they don't fight the rest of the app and so a key press
+        inside an open cell editor goes to the editor, not here."""
+        def add(seq, slot):
+            sc = QShortcut(seq, self.view)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(slot)
+            return sc
+        add(QKeySequence.StandardKey.Copy, self._copy_selection)
+        add(QKeySequence.StandardKey.Paste, self._paste_selection)
+        add(QKeySequence.StandardKey.Undo, self.undo_stack.undo)
+        add(QKeySequence.StandardKey.Redo, self.undo_stack.redo)   # Ctrl+Y
+        add(QKeySequence("Ctrl+Shift+Z"), self.undo_stack.redo)
+
+    def _apply_cell(self, row: int, col: int, value, dirty: bool) -> bool:
+        """THE single validated write path, shared by typed edits, paste, and
+        undo/redo. Runs the column setter, recomputes validation + status, and
+        sets the `dirty` flag to the GIVEN value (so undo can restore a cell to
+        its prior clean/dirty state, not unconditionally dirty). Never writes
+        the model/table directly past the setter. Returns False for
+        non-editable / orphan / out-of-range cells."""
+        if not (0 <= row < len(self.entries)):
+            return False
+        e = self.entries[row]
+        setter = _COLUMNS[col][2]
+        if setter is None or e.is_orphan:
+            return False
+        setter(e.raw, "" if value is None else str(value))
+        e.dirty = dirty
+        e.staged = False          # any change un-stages -> needs re-confirm
+        self._revalidate(e)
+        self.model.row_changed(row)
+        return True
+
+    @staticmethod
+    def _cell_editable(e: _Entry, col: int) -> bool:
+        """Mirror of _ManifestModel.flags' editable test: a column with a
+        setter, on a non-orphan row. Used to skip non-editable paste targets
+        (status, filename, orphan rows) -- respecting the existing Qt flags."""
+        return _COLUMNS[col][2] is not None and not e.is_orphan
+
+    def _copy_selection(self):
+        """Copy the current cell selection to the clipboard as TSV (tab =
+        column, newline = row); a single cell copies a single token. Unselected
+        cells inside the selection's bounding box are emitted empty. TSV also
+        gives Excel interop for free."""
+        sel = self.view.selectionModel().selectedIndexes()
+        if not sel:
+            return
+        rows = [i.row() for i in sel]
+        cols = [i.column() for i in sel]
+        r0, r1, c0, c1 = min(rows), max(rows), min(cols), max(cols)
+        grid = [["" for _ in range(c1 - c0 + 1)] for _ in range(r1 - r0 + 1)]
+        for i in sel:
+            grid[i.row() - r0][i.column() - c0] = \
+                _fmt(i.data(Qt.ItemDataRole.EditRole))
+        tsv = "\n".join("\t".join(line) for line in grid)
+        QApplication.clipboard().setText(tsv)
+        n = len(sel)
+        self.log(f"Copied {n} cell(s) to clipboard."
+                 if n > 1 else "Copied 1 cell to clipboard.")
+
+    def _paste_selection(self):
+        """Paste the clipboard over the selection, anchored at its top-left:
+          - one clipboard value + multi-cell selection -> fill EVERY selected
+            editable, enum-valid cell (the primary case);
+          - one value + single cell -> set that cell;
+          - a TSV block -> write it expanding right/down from the anchor.
+        Every write goes through _apply_cell (validated path) as ONE undoable
+        action. Non-editable target cells are skipped; enum cells take the value
+        only if it's allowed (or blank), else skipped -- paste is never a hole
+        through the role/unit guard. Skips are summarized to the log
+        (non-blocking)."""
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        raw = text
+        if raw.endswith("\r\n"):
+            raw = raw[:-2]
+        elif raw.endswith("\n") or raw.endswith("\r"):
+            raw = raw[:-1]
+        block = [line.split("\t") for line in raw.replace("\r\n", "\n").split("\n")]
+        single = len(block) == 1 and len(block[0]) == 1
+
+        sel = self.view.selectionModel().selectedIndexes()
+        cur = self.view.currentIndex()
+        if sel:
+            anchor_r = min(i.row() for i in sel)
+            anchor_c = min(i.column() for i in sel)
+        elif cur.isValid():
+            anchor_r, anchor_c = cur.row(), cur.column()
+        else:
+            return                              # nothing to paste into
+
+        # Build the list of (proxy_row, proxy_col, value) targets.
+        targets = []
+        if single and len(sel) > 1:
+            v = block[0][0]
+            targets = [(i.row(), i.column(), v) for i in sel]
+        elif single:
+            targets = [(anchor_r, anchor_c, block[0][0])]
+        else:
+            for i, line in enumerate(block):
+                for j, val in enumerate(line):
+                    targets.append((anchor_r + i, anchor_c + j, val))
+
+        written = []                 # (src_row, col, old, old_dirty, new)
+        filled = skipped_noned = skipped_invalid = 0
+        for pr, pc, val in targets:
+            pidx = self.proxy.index(pr, pc)
+            if not pidx.isValid():
+                continue
+            src = self.proxy.mapToSource(pidx)
+            srow, col = src.row(), src.column()
+            if not (0 <= srow < len(self.entries)):
+                continue
+            e = self.entries[srow]
+            if not self._cell_editable(e, col):
+                skipped_noned += 1
+                continue
+            choices = _COLUMNS[col][3]
+            if choices is not None and val != "" and val not in choices:
+                skipped_invalid += 1
+                continue
+            old_value = _COLUMNS[col][1](e)
+            filled += 1
+            if str(val) != old_value:
+                written.append((srow, col, old_value, e.dirty, str(val)))
+
+        if written:
+            self.undo_stack.push(
+                _MultiCellEditCommand(self, written,
+                                      text=f"paste {len(written)} cell(s)"))
+
+        skipped = skipped_noned + skipped_invalid
+        if skipped or filled:
+            bits = []
+            if skipped_noned:
+                bits.append(f"{skipped_noned} non-editable")
+            if skipped_invalid:
+                bits.append(f"{skipped_invalid} invalid role/unit")
+            tail = f", skipped {skipped}: {', '.join(bits)}" if skipped else ""
+            self.log(f"Pasted {filled} cell(s){tail}.")
 
     # ---- additive registry (Add to registry) ------------------------------
     @staticmethod

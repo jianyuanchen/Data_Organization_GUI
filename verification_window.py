@@ -30,6 +30,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg, NavigationToolbar2QT)
+from matplotlib.widgets import SpanSelector
 
 from models import REVIEW_STATUS_COLORS, VISIBLE_COLUMNS
 from plotting import read_csv_columns
@@ -51,6 +52,10 @@ _SIGNAL_DB_FIELDS = {
     "UV": ("peak_uv", "peak_uv_wl"),
 }
 _PLOT_X_RANGE = (300, 700)                  # full wavelength axis, always visible
+# Smallest drag (nm) that counts as a range selection -- below this a left-drag
+# reads as a click (which just switches the active subplot), so a stray tiny
+# drag never sets a degenerate range.
+_MIN_DRAG_SPAN_NM = 2.0
 
 
 # Sidebar row tint per review_status. Built from the shared hex codes in
@@ -105,6 +110,25 @@ def _additive_tail(record: dict) -> str:
     return f" + {name} {amount}".rstrip()
 
 
+class _ToolbarAwareSpanSelector(SpanSelector):
+    """Horizontal SpanSelector that YIELDS to the matplotlib nav toolbar.
+
+    SpanSelector and the toolbar's pan/zoom both grab left-drag and would
+    fight. While a toolbar MODE is active (`toolbar.mode` is "pan"/"zoom"),
+    this selector ignores presses so left-drag pans/zooms; with no mode active
+    it selects a range. Same toolbar.mode guard the CD-Shape review window uses
+    for its on-plot handle drag, applied here at the SpanSelector level."""
+
+    def __init__(self, *args, toolbar=None, **kwargs):
+        self._toolbar = toolbar
+        super().__init__(*args, **kwargs)
+
+    def ignore(self, event):
+        if self._toolbar is not None and getattr(self._toolbar, "mode", ""):
+            return True
+        return super().ignore(event)
+
+
 def _flagged_fields(record: dict) -> set:
     """Parse a row's `flags` column as a JSON list of field names. Empty
     string / invalid JSON / non-list payload all yield the empty set.
@@ -156,6 +180,17 @@ class VerificationWindow(QDialog):
         # Persisted to the DB by Confirm; discarded on Reject / Needs Work /
         # navigation -- explicit, simple, no per-record buffer.
         self.pending_edits: dict[str, str] = {}
+
+        # SINGLE SOURCE OF TRUTH for the analysis wavelength range. Both input
+        # paths -- the typed Range min/max boxes AND on-plot drag-select -- feed
+        # _set_range, which is the ONLY thing that updates the boxes, the shaded
+        # span on every subplot, and (implicitly) the readout. None = no range
+        # set (Find Max/Min then asks for one). `_updating_range` is the
+        # reentrancy guard that stops typing->span->boxes (and drag->boxes->span)
+        # from recursing.
+        self._range: tuple[float, float] | None = None
+        self._updating_range = False
+        self._span_selectors: list = []
 
         self._build_ui()
         if self.records:
@@ -234,8 +269,11 @@ class VerificationWindow(QDialog):
         plot_box = QGroupBox("Per-record plots")
         plot_v = QVBoxLayout(plot_box)
 
-        # Range inputs: typed numeric boxes drive an axvspan band on all
-        # three subplots. Drag-select on the canvas is a future improvement.
+        # Range inputs: typed numeric boxes are ONE view of the single range
+        # state (self._range). The OTHER view is drag-select directly on the
+        # plots (SpanSelector, wired in _install_span_selectors). Either path
+        # routes through _set_range, so the boxes and the shaded span can never
+        # disagree.
         range_row = QHBoxLayout()
         range_row.addWidget(QLabel("Range min (nm):"))
         self.range_min_input = QLineEdit()
@@ -339,6 +377,11 @@ class VerificationWindow(QDialog):
         # row, CSV read failed, etc.). Find Max/Min/Apply refuse in that
         # state and the buttons are disabled.
         self._has_plot_data = False
+
+        # On-plot drag-to-select (the second view of the range). Created last,
+        # once self.toolbar + self._sig_axes exist, so the selectors can yield
+        # to pan/zoom via the toolbar.mode guard.
+        self._install_span_selectors()
 
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 4)
@@ -650,6 +693,9 @@ class VerificationWindow(QDialog):
 
         for ax in self._sig_axes.values():
             ax.clear()
+        # ax.clear() drops each SpanSelector's artist; rebuild them against the
+        # freshly-cleared axes so drag-select keeps working on the new record.
+        self._install_span_selectors()
 
         r = self.records[self.current_index] if self.current_index >= 0 else None
         if not r:
@@ -676,7 +722,7 @@ class VerificationWindow(QDialog):
         self._has_plot_data = True
         self._set_peak_controls_enabled(True)
         self._draw_axes_chrome()
-        self._draw_highlight_band()
+        self._draw_range_span()          # re-draw the span from the range state
         self._reset_nav_history()
         self.canvas.draw_idle()
 
@@ -768,14 +814,12 @@ class VerificationWindow(QDialog):
         self.find_min_btn.setEnabled(enabled)
         self.apply_peak_btn.setEnabled(enabled)
 
-    # --- highlight band ----------------------------------------------------
-    def _on_range_changed(self, _text: str):
-        # Inputs are independent QLineEdits; either one changing rebuilds
-        # the band. Empty / non-numeric => band hidden.
-        self._draw_highlight_band()
-        self.canvas.draw_idle()
-
+    # --- range state: ONE setter, two input views (typed boxes + drag) -----
     def _parse_range(self):
+        """Parse the two typed boxes into (lo, hi), or None when either is
+        blank/non-numeric or lo >= hi. This is how the TYPED view reads its
+        inputs; partial/empty stays None (Find then asks for a range), so the
+        existing edge/full-spectrum semantics are unchanged."""
         try:
             lo = float(self.range_min_input.text())
             hi = float(self.range_max_input.text())
@@ -785,25 +829,110 @@ class VerificationWindow(QDialog):
             return None
         return lo, hi
 
-    def _draw_highlight_band(self):
-        """Remove any previously-drawn axvspan handles and redraw on each
-        subplot from the current range inputs. Sharex aligns the bands
-        across the column so they read as one selection.
-        """
+    def _on_range_changed(self, _text: str):
+        """Typed-box view changed -> push it into the single range state.
+        Reentrancy-guarded: a programmatic box update from _set_range (drag
+        path) sets _updating_range, so this returns immediately and never
+        loops back."""
+        if self._updating_range:
+            return
+        band = self._parse_range()
+        if band is None:
+            self._set_range(None, None, source="type")
+        else:
+            self._set_range(band[0], band[1], source="type")
+
+    def _set_range(self, lo, hi, *, source: str):
+        """THE single writer of the range. Updates the range state, the shaded
+        span on all three subplots, and (unless the edit CAME from the boxes)
+        the typed boxes themselves -- which double as the live nm readout.
+        Nothing else writes those surfaces. `source` is "type" (from the boxes,
+        so don't overwrite them) or "drag"/"drag-live" (from the plot, so
+        mirror the values into the boxes). The _updating_range guard makes the
+        box writes here not re-fire _on_range_changed."""
+        valid = (lo is not None and hi is not None and float(hi) > float(lo))
+        self._range = (float(lo), float(hi)) if valid else None
+        self._updating_range = True
+        try:
+            if source != "type":
+                self.range_min_input.setText("" if not valid else f"{lo:.0f}")
+                self.range_max_input.setText("" if not valid else f"{hi:.0f}")
+            self._draw_range_span()
+            self.canvas.draw_idle()
+        finally:
+            self._updating_range = False
+
+    def _draw_range_span(self):
+        """Redraw the shaded analysis-window span on EVERY subplot from the
+        single range state. Removes the previous span artists first; draws
+        nothing when the range is unset. sharex keeps the three spans aligned
+        so they read as one selection mirrored across CD / g / UV."""
         for h in self._band_artists:
             try:
                 h.remove()
             except Exception:
                 pass
         self._band_artists = []
-        band = self._parse_range()
-        if band is None:
+        if self._range is None:
             return
-        lo, hi = band
+        lo, hi = self._range
         for ax in self._sig_axes.values():
             self._band_artists.append(
-                ax.axvspan(lo, hi, alpha=0.18,
-                           color="#ffd24d", zorder=0))
+                ax.axvspan(lo, hi, alpha=0.18, color="#ffd24d", zorder=0))
+
+    # --- on-plot drag-select (the second view of the range) ----------------
+    def _install_span_selectors(self):
+        """One horizontal SpanSelector per subplot. A drag on ANY of the three
+        sets the same range (they share the x-axis); on release the committed
+        span is mirrored across all three by _set_range. interactive=False so
+        the drag rubber-band is a transient PREVIEW that clears on release,
+        leaving only our mirrored axvspan -- no double shading. Draggable across
+        the FULL axis (no sub-band clamp). Each selector yields to pan/zoom via
+        the toolbar.mode guard in _ToolbarAwareSpanSelector.
+
+        Idempotent + re-callable: each SpanSelector adds a (hidden) artist to
+        its axes, which ax.clear() in _refresh_plots removes -- so the selectors
+        are disconnected and rebuilt after every record's plot rebuild rather
+        than left pointing at a detached artist."""
+        for ss in self._span_selectors:
+            try:
+                ss.disconnect_events()
+            except Exception:
+                pass
+        self._span_selectors = []
+        props = dict(facecolor="#ffd24d", alpha=0.25)
+        for ax in self._sig_axes.values():
+            self._span_selectors.append(
+                _ToolbarAwareSpanSelector(
+                    ax, self._on_span_select, "horizontal",
+                    minspan=_MIN_DRAG_SPAN_NM, useblit=False, props=props,
+                    onmove_callback=self._on_span_move, interactive=False,
+                    button=1, toolbar=self.toolbar))
+
+    def _on_span_move(self, vmin, vmax):
+        """Live nm readout while dragging: update the typed boxes (the readout)
+        in step. Guarded so it doesn't re-fire _on_range_changed; the visible
+        live span during the drag is the SpanSelector's own rubber-band, so we
+        don't redraw the persistent span here."""
+        lo, hi = (vmin, vmax) if vmax >= vmin else (vmax, vmin)
+        self._updating_range = True
+        try:
+            self.range_min_input.setText(f"{lo:.0f}")
+            self.range_max_input.setText(f"{hi:.0f}")
+        finally:
+            self._updating_range = False
+
+    def _on_span_select(self, vmin, vmax):
+        """Drag released -> commit the range through the single setter (updates
+        boxes + mirrored span + readout). Rounded to whole nm so a dragged
+        range and the equivalent typed range produce identical state. A
+        sub-threshold drag (≈ a click) commits nothing -- the click still
+        switches the active subplot via _on_canvas_click. Find Max/Min is NOT
+        auto-run; drag only SETS the range."""
+        lo, hi = (vmin, vmax) if vmax >= vmin else (vmax, vmin)
+        if hi - lo < _MIN_DRAG_SPAN_NM:
+            return
+        self._set_range(round(lo), round(hi), source="drag")
 
     # --- find max / min within the band -----------------------------------
     def _find_extreme(self, kind: str):
@@ -814,13 +943,14 @@ class VerificationWindow(QDialog):
         """
         if not self._has_plot_data:
             return
-        band = self._parse_range()
+        # Read the SINGLE range state (set by typing OR by drag -- same source).
+        band = self._range
         if band is None:
             QMessageBox.information(
                 self, "Set wavelength range first",
-                "Enter Range min and Range max (in nm) before searching "
-                "for a peak. Find Max / Find Min operate only within the "
-                "highlighted band.")
+                "Set Range min and Range max (in nm) before searching for a "
+                "peak — type them, or drag across a plot. Find Max / Find Min "
+                "operate only within the highlighted band.")
             return
         lo, hi = band
         r = self.records[self.current_index]
