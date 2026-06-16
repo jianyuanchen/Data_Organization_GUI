@@ -56,6 +56,11 @@ _LEGACY_ADDITIVE_COLS = ("dopant", "dopant_conc_mg_ml", "doping_min")
 
 _REQUIRED = [c["name"] for c in MANIFEST_COLUMNS if c["required"]]
 _FLOAT_FIELDS = {c["name"] for c in MANIFEST_COLUMNS if c["type"] == "float"}
+# Column-level enums, declared once in config. allowed:None columns (free-form,
+# or polymorphic like poly1_chir/poly2_chir whose R/S vs % rule lives in
+# _polymer_token) are skipped, so the generic enum step never touches them.
+_ALLOWED = {c["name"]: c["allowed"]
+            for c in MANIFEST_COLUMNS if c.get("allowed")}
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +201,32 @@ def _num(v):
     Raises ValueError on malformed input."""
     f = float(str(v).strip())
     return int(f) if f == int(f) else f
+
+
+def _check_enum(field: str, value: str, errors: list, warnings: list) -> str:
+    """Validate a NON-BLANK value against the column's config `allowed` list,
+    case-insensitively. Returns the canonical cased member:
+
+      - exact member            -> returned unchanged
+      - case-variant of a member-> AUTO-CORRECTED: warn + return the cased
+                                    member (mirrors the old solvent behavior)
+      - matches nothing         -> error appended, original value returned
+
+    Blank values and allowed:None fields are the caller's concern (the
+    _REQUIRED loop owns required-ness); this never errors on them.
+    """
+    allowed = _ALLOWED.get(field)
+    if not allowed or not value:
+        return value
+    if value in allowed:
+        return value
+    canon = {a.lower(): a for a in allowed}.get(value.lower())
+    if canon is not None:
+        warnings.append(f"{field} '{value}' normalized to '{canon}'")
+        return canon
+    errors.append(
+        f"unknown {field} '{value}' (expected one of {', '.join(allowed)})")
+    return value
 
 
 def _version_tuple(v: str) -> tuple:
@@ -466,21 +497,15 @@ def validate_row(row: dict) -> tuple[str, list[str], Optional[dict]]:
             errors.append(f"malformed number: {name}='{str(v).strip()}'")
             nums[name] = None
 
-    solvent = get("solvent")
-    if solvent and solvent not in SOLVENTS:
-        fixed = _SOLVENT_CASE.get(solvent.lower())
-        if fixed:
-            warnings.append(
-                f"solvent '{solvent}' normalized to '{fixed}'")
-            solvent = fixed
-        else:
-            errors.append(
-                f"unknown solvent '{solvent}' (expected one of "
-                f"{', '.join(SOLVENTS)})")
+    # Column-level enums are validated declaratively from config `allowed`
+    # (see _check_enum / _ALLOWED). solvent auto-corrects case; state keeps its
+    # .upper() coercion BEFORE the check, so parsed["state"] and the annealing
+    # conditionals below both see the uppercased value (an already-canonical
+    # value matches exactly, so no spurious normalization warning fires).
+    solvent = _check_enum("solvent", get("solvent"), errors, warnings)
 
     state = get("state").upper()
-    if get("state") and state not in ("AP", "AN"):
-        errors.append(f"bad state '{get('state')}' (expected AP/AN)")
+    _check_enum("state", state, errors, warnings)
 
     # Conditional requirements around annealing.
     anneal_t = nums.get("anneal_T_C")
