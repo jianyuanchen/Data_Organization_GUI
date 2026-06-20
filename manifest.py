@@ -37,6 +37,7 @@ from models import (
     SOLVENTS,
     canon_path,
     classify_polymer,
+    count_additives,
 )
 from parser import _derive_config
 
@@ -658,4 +659,8 @@ def build_metadata(parsed: dict, csv_path: Optional[str] = None) -> Meta:
         additive1_conc=parsed.get("additive1_conc"),
         additive1_unit=parsed.get("additive1_unit"),
         additive1_min=parsed.get("additive1_min"),
+        # m = populated additive blocks. count_additives loops 1..MAX_ADDITIVES,
+        # so additive2_* is counted automatically once it exists -- no change
+        # here. n stays n_components above; together they give the (n, m) label.
+        n_additives=count_additives(parsed, MAX_ADDITIVES),
     )

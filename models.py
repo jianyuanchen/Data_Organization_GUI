@@ -79,6 +79,15 @@ class Meta:
     additive1_conc: Optional[float] = None
     additive1_unit: Optional[str] = None       # one of config.ADDITIVE_UNITS
     additive1_min: Optional[float] = None       # exposure/doping time (minutes)
+    # Additive COUNT -- the 'm' in the (n, m) system label, where n is
+    # n_components (polymer count) and m is the number of populated additive
+    # blocks. So (2, 0) = two polymers / no additive; (1, 1) = one polymer +
+    # one additive (e.g. F8BT + RDO). Derived from the additiveN_name fields via
+    # count_additives at ingest -- the regex/filename path is always 0 (filenames
+    # never encode additives). STORED + queryable so it can back a future
+    # additive filter, but HIDDEN from the staging/verification UI (not
+    # hand-edited): it follows the additive blocks, which are the source of truth.
+    n_additives: int = 0
     # ---- forward-looking metadata (stored, not yet used by any logic) -------
     # Stable per-record id. Independent of csv_path so it survives file moves
     # and is the durable hook for future MongoDB / vector-DB integrations.
@@ -124,6 +133,28 @@ def classify_polymer(token: str):
     return (token, "achiral", None, None)
 
 
+def count_additives(fields, max_additives: int) -> int:
+    """Number of populated additive blocks -- the 'm' in the (n, m) system label
+    (n = n_components polymer count, m = additive count).
+
+    A block N counts as PRESENT when its additiveN_name is non-empty. This
+    INCLUDES an UNKNOWN/amber additive (name captured, role unconfirmed) --
+    presence is name-only, not role-known. A NONE block (blank additiveN_name)
+    does not count. The loop runs 1..max_additives, so a future additive2_*
+    block is counted with no change here; callers pass config.MAX_ADDITIVES,
+    kept as an argument so this pure module never imports config.
+
+    `fields` is any mapping carrying additiveN_name keys -- a validated manifest
+    row (manifest.build_metadata) or a Meta-as-dict.
+    """
+    count = 0
+    for i in range(1, max_additives + 1):
+        name = fields.get(f"additive{i}_name")
+        if name is not None and str(name).strip():
+            count += 1
+    return count
+
+
 # Column list driving the SQLite schema and (filtered) the staging table.
 COLUMNS = list(Meta.__annotations__.keys())
 
@@ -131,7 +162,10 @@ COLUMNS = list(Meta.__annotations__.keys())
 # in the staging table. Kept here so the table layout stays in sync with the
 # data model.
 HIDDEN_COLUMNS = ("record_id", "flags", "verified", "verified_date", "added_by",
-                  "batch_id", "review_status", "parse_error")
+                  "batch_id", "review_status", "parse_error",
+                  # Derived additive count (m); store-only, follows the additive
+                  # blocks rather than being independently editable.
+                  "n_additives")
 VISIBLE_COLUMNS = [c for c in COLUMNS if c not in HIDDEN_COLUMNS]
 
 # Left-to-right display order for the MAIN staging table ONLY. A pure reordering

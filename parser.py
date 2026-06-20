@@ -107,6 +107,9 @@ def parse_filename(path: str) -> Meta:
         p1_name=p1, p1_backbone=p1b, p1_chirality=p1c, p1_hand=p1h, p1_pct=p1p,
         p2_name=p2, p2_backbone=p2b, p2_chirality=p2c, p2_hand=p2h, p2_pct=p2p,
         n_components=n, config=_derive_config(p1c, p2c, n),
+        # The filename convention never encodes additives, so m is always 0
+        # on the regex path: (n, m) = (n_components, 0).
+        n_additives=0,
         ratio=ratio, conc=conc, solvent=solvent, film_state=state,
         speed_mm_s=speed_val, anneal_temp=anneal_temp,
         anneal_time=(DEFAULT_ANNEAL_TIME if state == "AN" else None),

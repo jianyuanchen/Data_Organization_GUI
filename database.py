@@ -140,6 +140,10 @@ class DB:
             self._review_status_backfill = self._backfill_review_status()
         except Exception:
             self._review_status_backfill = 0
+        try:
+            self._n_additives_backfill = self._backfill_n_additives()
+        except Exception:
+            self._n_additives_backfill = 0
 
     def _dedupe_canonical_paths(self) -> int:
         """Collapse rows whose csv_path differs only in slash/case/normalization.
@@ -218,6 +222,26 @@ class DB:
         for row in rows:
             self.conn.execute(
                 "UPDATE scans SET review_status='pending' WHERE csv_path=?",
+                (row["csv_path"],))
+            n += 1
+        self.conn.commit()
+        return n
+
+    def _backfill_n_additives(self) -> int:
+        """Default existing rows to n_additives=0 after migration.
+
+        ALTER TABLE ADD COLUMN lands a NULL on every pre-existing row. Every
+        such row predates additive support and carries zero additives, so 0 is
+        the correct historical value -- (n, m) = (n_components, 0). Backfilling 0
+        (not leaving NULL) keeps a future 'm = 0' filter matching these rows.
+        Idempotent: subsequent startups find nothing to update.
+        """
+        rows = self.conn.execute(
+            "SELECT csv_path FROM scans WHERE n_additives IS NULL").fetchall()
+        n = 0
+        for row in rows:
+            self.conn.execute(
+                "UPDATE scans SET n_additives=0 WHERE csv_path=?",
                 (row["csv_path"],))
             n += 1
         self.conn.commit()
