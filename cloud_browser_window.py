@@ -150,6 +150,13 @@ class CloudBrowserWindow(QDialog):
         # Solvent values ever seen, so filtering by solvent never shrinks its
         # own dropdown. Grows across fetches; never removes options.
         self._known_solvents: set[str] = set()
+        # Additive name/role values ever seen (pulled from the nested
+        # `additives` array of fetched docs), so the additive-name / -role
+        # filters never shrink their own dropdowns. Grow-only, like solvents;
+        # growing from the data means every offered option actually matches
+        # something.
+        self._known_add_names: set[str] = set()
+        self._known_add_roles: set[str] = set()
         # Per-record latest computed peak: signal -> (wl, value, kind).
         self._computed_peaks: dict = {"CD": None, "g": None, "UV": None}
         self._band_artists: list = []
@@ -193,6 +200,29 @@ class CloudBrowserWindow(QDialog):
         self.f_film = QComboBox()
         self.f_film.addItems(["Any", "As Printed", "Annealed"])
         filt.addWidget(self.f_film)
+        filt.addSpacing(10)
+        # Additive filters (presence / specific name / role). Presence keys off
+        # n_additives via the nested array; name and role are grow-from-data
+        # dropdowns. All three AND together (and with the other filters).
+        filt.addWidget(QLabel("Additive:"))
+        self.f_add_presence = QComboBox()
+        self.f_add_presence.addItems(["Any", "Has additive", "No additive"])
+        self.f_add_presence.setToolTip(
+            "Filter by whether the film carries any additive.")
+        filt.addWidget(self.f_add_presence)
+        filt.addWidget(QLabel("name:"))
+        self.f_add_name = QComboBox()
+        self.f_add_name.addItem("Any")
+        self.f_add_name.setToolTip(
+            "Filter to films containing a specific additive. Options grow from "
+            "the additives seen in fetched records.")
+        filt.addWidget(self.f_add_name)
+        filt.addWidget(QLabel("role:"))
+        self.f_add_role = QComboBox()
+        self.f_add_role.addItem("Any")
+        self.f_add_role.setToolTip(
+            "Filter by additive role (e.g. small_molecule, dopant).")
+        filt.addWidget(self.f_add_role)
         filt.addSpacing(10)
         self.refresh_btn = QPushButton("Refresh / Apply")
         self.refresh_btn.setToolTip(
@@ -415,6 +445,27 @@ class CloudBrowserWindow(QDialog):
             query["film_state"] = "AP"
         elif film == "Annealed":
             query["film_state"] = "AN"
+        # Additive filters operate on the nested `additives` array. Presence
+        # tests for any element (additives.0); "No additive" matches docs whose
+        # array is empty or absent.
+        presence = self.f_add_presence.currentText()
+        if presence == "Has additive":
+            query["additives.0"] = {"$exists": True}
+        elif presence == "No additive":
+            query["additives.0"] = {"$exists": False}
+        # Name / role match a SINGLE additive carrying all chosen attributes via
+        # $elemMatch -- correct today (1 additive) and once a film can hold more
+        # than one. A name/role choice implies presence; combining it with
+        # "No additive" yields nothing, which is the honest contradictory answer.
+        elem: dict = {}
+        name = self.f_add_name.currentText()
+        if name and name != "Any":
+            elem["name"] = name
+        role = self.f_add_role.currentText()
+        if role and role != "Any":
+            elem["role"] = role
+        if elem:
+            query["additives"] = {"$elemMatch": elem}
         return query
 
     def refresh(self, initial: bool = False):
@@ -443,14 +494,25 @@ class CloudBrowserWindow(QDialog):
         self.records = records
         self.current_index = 0 if records else -1
 
-        # Grow the solvent dropdown from whatever solvents we've now seen, so
-        # the option list never shrinks just because a filter narrowed the
-        # current result set. Selection is preserved.
+        # Grow the solvent + additive dropdowns from whatever we've now seen, so
+        # an option list never shrinks just because a filter narrowed the
+        # current result set. Selections are preserved.
         for rec in records:
             s = rec.get("solvent")
             if s:
                 self._known_solvents.add(str(s))
+            # Additive name/role live in the nested array; the flat columns are
+            # collapsed away on promote. (rec.get("additives") or []) mirrors
+            # mongo_db.cloud_additives without importing it here.
+            for add in (rec.get("additives") or []):
+                nm = add.get("name")
+                if nm:
+                    self._known_add_names.add(str(nm))
+                rl = add.get("role")
+                if rl:
+                    self._known_add_roles.add(str(rl))
         self._rebuild_solvent_options()
+        self._rebuild_additive_options()
 
         self._rebuild_sidebar()
         self.count_label.setText(f"{len(records)} cloud records")
@@ -473,6 +535,24 @@ class CloudBrowserWindow(QDialog):
         idx = self.f_solvent.findText(prev)
         self.f_solvent.setCurrentIndex(idx if idx >= 0 else 0)
         self.f_solvent.blockSignals(False)
+
+    def _rebuild_additive_options(self):
+        """Repopulate the additive name + role dropdowns from the accumulated
+        known sets, preserving each current selection. Mirrors the solvent
+        rebuild: option lists grow across fetches and never shrink, so narrowing
+        one filter can't drop another's options.
+        """
+        for combo, known in ((self.f_add_name, self._known_add_names),
+                             (self.f_add_role, self._known_add_roles)):
+            prev = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Any")
+            for v in sorted(known):
+                combo.addItem(v)
+            idx = combo.findText(prev)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
 
     # ----------------------------------------------------------- sidebar ----
     def _rebuild_sidebar(self):
@@ -564,8 +644,19 @@ class CloudBrowserWindow(QDialog):
         self.record_header.setText(
             f"<b>Record {index + 1} of {len(self.records)}</b> "
             f"&nbsp;|&nbsp; record_id: <code>{rid}</code>")
+        # Cloud docs store the additive block NESTED under `additives`
+        # (_collapse_additives strips the flat additive1_* keys on promote), so
+        # reading rec.get("additive1_name") straight off the doc yields blanks.
+        # Reconstruct the flat additive{i}_* keys via the single nested->flat
+        # helper and overlay them so the generic VISIBLE_COLUMNS loop displays
+        # them. Guarded: if mongo_db is unavailable the labels just stay blank.
+        try:
+            from mongo_db import flatten_additives
+            view = {**rec, **flatten_additives(rec)}
+        except Exception:
+            view = rec
         for col, lab in self.field_labels.items():
-            val = rec.get(col)
+            val = view.get(col)
             lab.setText("" if val is None else str(val))
         self.sidebar.setCurrentRow(index)
         self._refresh_plots()

@@ -339,6 +339,27 @@ def cloud_additives(doc: dict) -> list:
     return doc.get("additives") or []
 
 
+def flatten_additives(doc: dict) -> dict:
+    """Inverse of _collapse_additives, for READERS that render the flat columns.
+
+    Reconstruct the flat additive{i}_name/role/conc/unit/min keys from a cloud
+    doc's nested `additives` array (1-indexed, in array order). This is the
+    single nested->flat translation point (the mirror of _collapse_additives):
+    a UI that displays the flat VISIBLE_COLUMNS can read the additive block out
+    of a stored (nested) doc without duplicating the field mapping. Returns ONLY
+    the additive keys -- merge it over the doc for display; it never mutates the
+    doc, and an undoped/empty doc yields {}.
+    """
+    flat: dict = {}
+    for i, add in enumerate(cloud_additives(doc), start=1):
+        flat[f"additive{i}_name"] = add.get("name")
+        flat[f"additive{i}_role"] = add.get("role")
+        flat[f"additive{i}_conc"] = add.get("conc")
+        flat[f"additive{i}_unit"] = add.get("unit")
+        flat[f"additive{i}_min"] = add.get("min")
+    return flat
+
+
 def _build_cloud_doc(record: dict, wavelength, g, cd, uv, data_hash: str,
                      fkey: str, filename: str, promoted_at: str) -> dict:
     """Build the canonical stored cloud document from a local record + spectra.

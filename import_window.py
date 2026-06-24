@@ -200,7 +200,7 @@ _COLUMNS = [
      _set_field("additive1_conc"), None),
     ("add. unit", lambda e: _fmt(e.raw.get("additive1_unit")),
      _set_field("additive1_unit"), ADDITIVE_UNITS),
-    ("add. min", lambda e: _fmt(e.raw.get("additive1_min")),
+    ("add. time (min)", lambda e: _fmt(e.raw.get("additive1_min")),
      _set_field("additive1_min"), None),
     ("peak_gval", lambda e: _fmt(e.raw.get("peak_gval")),
      _set_field("peak_gval"), None),
