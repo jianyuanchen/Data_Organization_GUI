@@ -56,7 +56,7 @@ if not mongo_configured():
 # the way `solvent` is validated against models.SOLVENTS -- a typo'd role or a
 # bogus unit is caught at ingest instead of silently corrupting a query later.
 ADDITIVE_ROLES = ["dopant", "solvent_additive", "plasticizer",
-                  "nucleating_agent", "unknown"]
+                  "nucleating_agent", "small_molecule", "unknown"]
 ADDITIVE_UNITS = ["mg_ml", "vol_pct", "mol_pct", "wt_pct"]
 
 # Films are 0-1 additive today. To extend: bump this AND copy-paste the
